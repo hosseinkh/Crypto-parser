@@ -131,3 +131,14 @@ def compute_indicators(
     out["dist_to_range_low"] = dists["dist_to_low"]
 
     return out
+
+# ---------- Volume Z-Score ----------
+def volume_zscore(v: pd.Series, length: int = 20) -> pd.Series:
+    """
+    Rolling z-score of volume. Values > ~2 often signal volume spikes.
+    """
+    mean = v.rolling(length, min_periods=length).mean()
+    std = v.rolling(length, min_periods=length).std()
+    z = (v - mean) / std.replace(0, np.nan)
+    return z.fillna(0)
+
