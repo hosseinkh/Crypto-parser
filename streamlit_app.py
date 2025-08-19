@@ -5,12 +5,12 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from utils.bitget import make_exchange, normalize_symbol, fetch_ohlcv_df, now_utc_iso
-from utils import indicators as ind
-from utils import filters as filt
-from utils import snapshot as snap
-from utils import trade_log as tlog
-from utils import sentiment as sent
+from utiles.bitget import make_exchange, normalize_symbol, fetch_ohlcv_df, now_utc_iso
+from utiles import indicators as ind
+from utiles import filters as filt
+from utiles import snapshot as snap
+from utiles import trade_log as tlog
+from utiles import sentiment as sent
 
 st.set_page_config(page_title="Bitget Crypto Scanner", layout="wide")
 
