@@ -1,157 +1,99 @@
 # utiles/snapshot.py
 
 from __future__ import annotations
-
-import math
 import numpy as np
 import pandas as pd
-from datetime import timezone
 
-# Use the indicators module that already exists in utiles/
-# (streamlit_app also imports it as `ind`)
+# fetch directly from utiles.bitget (do not rely on `ex`)
+from .bitget import fetch_ohlcv_df
+
+# indicators from your local module
 from .indicators import (
-    rsi,
-    ema,
-    atr,
-    volume_zscore,
-    macd,
-    bbands,
-    rolling_extrema,
-    distance_to_levels,
+    rsi, ema, atr, volume_zscore,
 )
 
-# --------------------------
-# Helpers
-# --------------------------
+# ---------- helpers ----------
 
 def _to_iso_utc(x) -> str:
-    """
-    Convert many possible timestamp formats to ISO UTC (yyyy-mm-ddTHH:MM:SSZ).
-    Accepts pandas Timestamps, epoch ms / s, strings, etc.
-    """
     try:
-        # pandas Timestamp or parseable string
         ts = pd.to_datetime(x, utc=True)
         return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
     except Exception:
         try:
-            # numeric epoch (try ms, then s)
             xi = int(x)
-            if xi > 10_000_000_000:  # likely ms
-                ts = pd.to_datetime(xi, unit="ms", utc=True)
-            else:
-                ts = pd.to_datetime(xi, unit="s", utc=True)
+            unit = "ms" if xi > 10_000_000_000 else "s"
+            ts = pd.to_datetime(xi, unit=unit, utc=True)
             return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
         except Exception:
-            # last resort
             return str(x)
 
-def _ensure_ohlcv_columns(df: pd.DataFrame) -> None:
-    required = {"time", "open", "high", "low", "close", "volume"}
-    missing = required - set(df.columns)
+def _ensure_cols(df: pd.DataFrame):
+    need = {"time", "open", "high", "low", "close", "volume"}
+    missing = need - set(df.columns)
     if missing:
         raise ValueError(f"OHLCV dataframe missing columns: {missing}")
 
 def df_to_last_candles(df: pd.DataFrame, max_rows: int = 60) -> list[dict]:
-    """
-    Convert the tail of an OHLCV dataframe to the compact list-of-dicts format:
-    [{t,o,h,l,c,v}, ...]
-    """
-    _ensure_ohlcv_columns(df)
-    rows = df.tail(max_rows).copy()
-
-    # Make sure 'time' is a column, not index
-    if "time" not in rows.columns and rows.index.name in (None, "time"):
-        rows = rows.reset_index()
-
-    out = []
-    for _, r in rows.iterrows():
-        out.append({
-            "t": _to_iso_utc(r["time"]),
-            "o": float(r["open"]),
-            "h": float(r["high"]),
-            "l": float(r["low"]),
-            "c": float(r["close"]),
-            "v": float(r["volume"]),
-        })
-    return out
+    _ensure_cols(df)
+    rows = df.tail(max_rows).reset_index(drop=True)
+    return [
+        {
+            "t": _to_iso_utc(rows.loc[i, "time"]),
+            "o": float(rows.loc[i, "open"]),
+            "h": float(rows.loc[i, "high"]),
+            "l": float(rows.loc[i, "low"]),
+            "c": float(rows.loc[i, "close"]),
+            "v": float(rows.loc[i, "volume"]),
+        }
+        for i in range(len(rows))
+    ]
 
 def summarize_frame(df: pd.DataFrame) -> dict:
-    """
-    Compute a lightweight summary set of indicators and a basic trend label.
-    Keeps it cheap so it runs fine on Streamlit Cloud.
-    """
-    _ensure_ohlcv_columns(df)
+    _ensure_cols(df)
     close = df["close"]
+    rsi14 = rsi(close, 14).iloc[-1]
+    ema21 = ema(close, 21).iloc[-1]
+    ema50 = ema(close, 50).iloc[-1]
+    atr14 = atr(df, 14).iloc[-1]
+    vz20 = volume_zscore(df["volume"], 20).iloc[-1]
 
-    # Core indicators
-    rsi_14 = rsi(close, length=14).iloc[-1]
-    ema_fast = ema(close, length=21).iloc[-1]
-    ema_slow = ema(close, length=50).iloc[-1]
-    atr_14 = atr(df, length=14).iloc[-1]
-    vol_z = volume_zscore(df["volume"], length=20).iloc[-1]
-
-    # Very simple trend classification
-    if ema_fast > ema_slow:
+    if ema21 > ema50:
         trend = "up"
-    elif ema_fast < ema_slow:
+    elif ema21 < ema50:
         trend = "down"
     else:
         trend = "sideways"
 
+    def f(x): return float(x) if pd.notna(x) else None
     return {
-        "rsi": float(rsi_14) if pd.notna(rsi_14) else None,
-        "ema_fast": float(ema_fast) if pd.notna(ema_fast) else None,
-        "ema_slow": float(ema_slow) if pd.notna(ema_slow) else None,
-        "atr": float(atr_14) if pd.notna(atr_14) else None,
-        "vol_z": float(vol_z) if pd.notna(vol_z) else None,
+        "rsi": f(rsi14),
+        "ema_fast": f(ema21),
+        "ema_slow": f(ema50),
+        "atr": f(atr14),
+        "vol_z": f(vz20),
         "trend": trend,
     }
 
-# --------------------------
-# Public API used by the app
-# --------------------------
+# ---------- public API ----------
 
 def build_tf_block(
-    ex,
+    ex_unused,                 # kept for signature compatibility; not used
     symbol: str,
     timeframe: str,
     lc_count: int = 50,
-    now_iso: str | None = None,
     **kwargs,
 ) -> dict:
     """
-    Fetch OHLCV for (symbol, timeframe) using `lc_count` candles and build a block:
-    {
-      "tf": "...",
-      "n_candles": N,
-      "last_candles": [{t,o,h,l,c,v}, ...],
-      "indicators": {...},
-      "structure": {...},
-      "notes": []
-    }
-
-    Extra **kwargs are accepted to keep compatibility with any future UI params.
+    Return a per-timeframe block used by the app. Fetches candles directly from
+    utiles.bitget.fetch_ohlcv_df to avoid relying on an `ex` object.
     """
-    # 1) Fetch data from the exchange helper (utiles/bitget.py)
-    #    Expected columns: time, open, high, low, close, volume
-    df = ex.fetch_ohlcv_df(symbol=symbol, timeframe=timeframe, limit=int(lc_count))
-    _ensure_ohlcv_columns(df)
+    df = fetch_ohlcv_df(symbol=symbol, timeframe=timeframe, limit=int(lc_count))
+    _ensure_cols(df)
 
-    # 2) Indicators + compact candles
     summary = summarize_frame(df)
     candles = df_to_last_candles(df, max_rows=min(int(lc_count), 120))
 
-    # 3) Minimal structure (placeholders for future enrichment)
-    structure = {
-        "trend": summary["trend"],
-        "local_sr": None,
-        "breakout": None,
-        "divergence": None,
-    }
-
-    # 4) Compose block
-    block = {
+    return {
         "tf": timeframe,
         "n_candles": int(len(df)),
         "last_candles": candles,
@@ -162,7 +104,11 @@ def build_tf_block(
             "atr": summary["atr"],
             "vol_z": summary["vol_z"],
         },
-        "structure": structure,
+        "structure": {
+            "trend": summary["trend"],
+            "local_sr": None,
+            "breakout": None,
+            "divergence": None,
+        },
         "notes": [],
     }
-    return block
