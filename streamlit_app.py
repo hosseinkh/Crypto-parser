@@ -18,8 +18,25 @@ st.set_page_config(page_title="Bitget Crypto Scanner – JSON Snapshot MVP", lay
 
 if "scan_results" not in st.session_state:
     st.session_state.scan_results = []
-if "symbols" not in st.session_state:
-    st.session_state.symbols = ["BTC/USDT", "ETH/USDT", "INJ/USDT", "GRT/USDT", "CRO/USDT", "TRX/USDT"]
+
+# Build a full symbol universe once (USDT spot-looking symbols)
+if "all_symbols" not in st.session_state:
+    ex_for_list = make_exchange()
+    ex_for_list.load_markets()
+    candidates = []
+    for m in ex_for_list.markets.values():
+        sym = m.get("symbol", "")
+        # keep simple SPOT-looking symbols like "BTC/USDT" (avoid futures like "BTC/USDT:USDT")
+        if "/" in sym and sym.endswith("/USDT") and (":" not in sym) and m.get("active", True):
+            candidates.append(sym)
+
+    # Ensure your favorites exist
+    curated = [
+        "BTC/USDT","ETH/USDT","INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT",
+        "AVAX/USDT","LINK/USDT","XRP/USDT","FET/USDT","SOL/USDT","ADA/USDT",
+    ]
+    st.session_state.all_symbols = sorted(set(candidates) | set(curated))
+
 if "timeframes" not in st.session_state:
     st.session_state.timeframes = ["15m", "1h", "4h"]
 
@@ -32,13 +49,29 @@ st.caption("No keys. No servers. Mobile-friendly. (UTC timestamps)")
 with st.sidebar:
     st.header("Settings")
 
-    # Symbols
+    # Default preselection (safe subset)
+    default_selection = [
+        s for s in ["INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT"]
+        if s in st.session_state.all_symbols
+    ] or ["BTC/USDT","ETH/USDT"]
+
+    # Symbols – now uses the full universe!
     symbols = st.multiselect(
         "Symbols (BASE/USDT)",
-        options=st.session_state.symbols,
-        default=["INJ/USDT", "GRT/USDT", "CRO/USDT", "TRX/USDT"],
+        options=st.session_state.all_symbols,
+        default=default_selection,
         help="Type to add more symbols like LINK/USDT, AVAX/USDT, FET/USDT…",
     )
+
+    # Optional: quick add a custom symbol even if Bitget list missed it
+    custom = st.text_input("Add custom (e.g., FET/USDT)")
+    if custom and custom.upper().endswith("/USDT"):
+        cs = custom.upper().strip()
+        if cs not in st.session_state.all_symbols:
+            st.session_state.all_symbols.append(cs)
+            st.session_state.all_symbols.sort()
+        if cs not in symbols:
+            symbols.append(cs)
 
     # Timeframes
     tfs = st.multiselect(
@@ -72,6 +105,7 @@ def run_scan(selected_symbols: list[str], selected_tfs: list[str], tf_limits: di
         for tf in selected_tfs:
             limit = int(tf_limits.get(tf, 50))
             try:
+                # our snapshot.build_tf_block supports 'limit=' kwarg
                 block = snap.build_tf_block(ex, sym_norm, tf, limit=limit)
                 rows.append({"symbol": sym_norm, "tf": tf, "block": block})
             except Exception as e:
