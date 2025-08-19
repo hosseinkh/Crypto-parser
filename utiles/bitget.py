@@ -29,3 +29,20 @@ def fetch_ohlcv_df(ex: ccxt.bitget, symbol: str, tf: str, limit: int) -> pd.Data
     df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df = df.sort_values("ts").reset_index(drop=True)
     return df
+
+# ---- Convenience wrapper used by snapshot.py ----
+def fetch_ohlcv_df(symbol: str, timeframe: str, limit: int = 200) -> pd.DataFrame:
+    """
+    Fetch OHLCV from Bitget without passing an exchange object.
+    Returns columns: time, open, high, low, close, volume (UTC).
+    """
+    ex = make_exchange()
+    sym = normalize_symbol(symbol)
+    tf = TIMEFRAME_MAP.get(timeframe, timeframe)  # allow "15m", "1h", "4h"
+
+    ohlcv = ex.fetch_ohlcv(sym, timeframe=tf, limit=limit)
+    df = pd.DataFrame(ohlcv, columns=["time", "open", "high", "low", "close", "volume"])
+    # Bitget/ccxt timestamp is ms — convert to UTC datetime then back to ISO only in snapshot
+    df["time"] = pd.to_datetime(df["time"], unit="ms", utc=True)
+    df = df.sort_values("time").reset_index(drop=True)
+    return df
