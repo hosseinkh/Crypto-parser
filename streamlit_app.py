@@ -10,6 +10,7 @@ import streamlit as st
 # ---- our utils (folder name: utiles) ----
 from utiles.bitget import make_exchange, normalize_symbol, now_utc_iso
 from utiles import snapshot as snap
+from utiles.snapshot import build_global_sentiment, meta_guide   # <-- NEW
 
 # =========================
 # Page config & session
@@ -105,7 +106,7 @@ def run_scan(selected_symbols: list[str], selected_tfs: list[str], tf_limits: di
         for tf in selected_tfs:
             limit = int(tf_limits.get(tf, 50))
             try:
-                # our snapshot.build_tf_block supports 'limit=' kwarg
+                # build_tf_block now also adds per-crypto 'sentiment' inside each timeframe
                 block = snap.build_tf_block(ex, sym_norm, tf, limit=limit)
                 rows.append({"symbol": sym_norm, "tf": tf, "block": block})
             except Exception as e:
@@ -116,6 +117,7 @@ def run_scan(selected_symbols: list[str], selected_tfs: list[str], tf_limits: di
 def pack_snapshot(rows: list[dict]) -> dict:
     """
     Group per-symbol and pack a single JSON snapshot ready to download.
+    Also injects global sentiment and a human-readable meta guide.
     """
     by_symbol: dict[str, dict] = {}
     for r in rows:
@@ -129,7 +131,8 @@ def pack_snapshot(rows: list[dict]) -> dict:
     packed = {
         "generated_at_utc": now_utc_iso(),
         "symbols": list(by_symbol.values()),
-        "meta": {"source": "bitget", "note": "LLM-friendly JSON snapshot"},
+        "sentiment_global": build_global_sentiment(),  # <-- NEW
+        "meta": meta_guide(),                          # <-- NEW
     }
     return packed
 
