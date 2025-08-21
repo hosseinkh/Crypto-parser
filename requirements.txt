@@ -4,3 +4,5 @@ numpy>=1.26
 requests>=2.32
 ccxt>=4.3
 python-dateutil>=2.9
+requests
+vaderSentiment
