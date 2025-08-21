@@ -54,7 +54,8 @@ with st.sidebar:
 
     # Default preselection (safe subset)
     default_selection = [
-        s for s in ["INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT"]
+        s for s in ["INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT","XRP/USDT","ETH/USDT","BTC/USDT","SOL/USDT",
+                   "ADA/USDT","FET/USDT","AVAX/USDT","LINK/USDT","PENGU/USDT","XTZ/USDT"]
         if s in st.session_state.all_symbols
     ] or ["BTC/USDT","ETH/USDT"]
 
