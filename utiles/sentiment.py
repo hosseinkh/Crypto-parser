@@ -2,130 +2,129 @@
 from __future__ import annotations
 
 import os
-import json
-from typing import Optional, List, Dict, Any
-
 import requests
-from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from typing import Dict, List, Optional
+import streamlit as st
 
-# ---- helpers -------------------------------------------------
-
-_analyzer = SentimentIntensityAnalyzer()
-
-def _symbol_base(symbol: str) -> str:
-    """
-    Extract base coin ticker from a pair like 'INJ/USDT' -> 'INJ'.
-    """
-    s = symbol.upper().strip()
-    return s.split("/")[0] if "/" in s else s
-
-def _normalize_score_01(compound: float) -> float:
-    """
-    VADER compound is in [-1, 1]. Map to [0, 1].
-    """
-    x = (compound + 1.0) / 2.0
-    return max(0.0, min(1.0, x))
-
-# ---- global sentiment: Fear & Greed (free) -------------------
-
-def get_fear_greed() -> Dict[str, Any]:
-    """
-    Fetch latest Crypto Fear & Greed Index from alternative.me.
-    No API key required.
-    Returns: {"value": int 0..100, "label": str, "source": "alternative.me"}
-    On failure, returns nulls.
-    """
-    url = "https://api.alternative.me/fng/?limit=1"
+# ---------- helpers ----------
+def _secret(name: str) -> Optional[str]:
+    # Try Streamlit secrets first, then environment (for local dev)
     try:
-        r = requests.get(url, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        item = (data.get("data") or [{}])[0]
-        value = int(item.get("value")) if item.get("value") is not None else None
-        label = item.get("value_classification")
-        return {
-            "value": value,
-            "label": label,
-            "source": "alternative.me",
-        }
-    except Exception:
-        return {"value": None, "label": None, "source": "alternative.me"}
-
-# ---- per-crypto sentiment via CryptoPanic (free key) --------
-
-def _get_cryptopanic_key() -> Optional[str]:
-    """
-    Resolve CRYPTOPANIC_API_KEY from (in order):
-    - Streamlit secrets (if running in Streamlit)
-    - Environment variable
-    """
-    try:
-        import streamlit as st  # type: ignore
-        if "CRYPTOPANIC_API_KEY" in st.secrets:
-            return st.secrets["CRYPTOPANIC_API_KEY"]
+        v = st.secrets.get(name)
+        if v:
+            return str(v)
     except Exception:
         pass
-    return os.environ.get("CRYPTOPANIC_API_KEY")
+    return os.environ.get(name)
 
-def fetch_news_titles_for(symbol: str, max_items: int = 30) -> List[str]:
+def _summarize_score(score: float) -> str:
+    if score > 0.25:
+        return "bullish"
+    if score < -0.25:
+        return "bearish"
+    return "neutral/mixed"
+
+# ---------- CryptoPanic per-symbol sentiment ----------
+def fetch_cryptopanic_per_symbol(bases: List[str]) -> Optional[Dict[str, dict]]:
     """
-    Fetch recent crypto news titles for the base ticker using CryptoPanic.
-    Requires a free API key; without it, returns [].
+    Builds a per-symbol sentiment dict using CryptoPanic headlines.
+    We approximate a score with (positive_votes - negative_votes) / max(1, total_votes).
     """
-    key = _get_cryptopanic_key()
+    key = _secret("CRYPTOPANIC_KEY")
     if not key:
-        return []
+        return None
 
-    base = _symbol_base(symbol)
-    url = "https://cryptopanic.com/api/v1/posts/"
-    params = {
-        "auth_token": key,
-        "currencies": base,   # e.g., BTC
-        "kind": "news",
-        "public": "true",
-    }
+    out: Dict[str, dict] = {}
+    for base in bases:
+        try:
+            # CryptoPanic requires 'auth_token' query param
+            r = requests.get(
+                "https://cryptopanic.com/api/v1/posts/",
+                params={
+                    "auth_token": key,
+                    "currencies": base,     # e.g. "BTC"
+                    "kind": "news",
+                    "public": "true",
+                    "page": 1,
+                },
+                timeout=12,
+            )
+            r.raise_for_status()
+            data = r.json()
+
+            pos = neg = 0
+            for item in data.get("results", []):
+                votes = item.get("votes") or item.get("vote") or {}
+                pos += int(votes.get("positive", 0))
+                neg += int(votes.get("negative", 0))
+
+            total = max(1, pos + neg)
+            score = (pos - neg) / total
+            out[f"{base}/USDT"] = {
+                "score": round(score, 3),
+                "summary": _summarize_score(score),
+                "articles_count": len(data.get("results", [])),
+                "source": "cryptopanic",
+            }
+        except Exception as e:
+            out[f"{base}/USDT"] = {
+                "score": None,
+                "summary": f"error: {e}",
+                "source": "cryptopanic",
+            }
+    return out
+
+# ---------- NewsAPI general market sentiment ----------
+def fetch_newsapi_general() -> Optional[dict]:
+    """
+    Pulls recent crypto headlines from NewsAPI and produces a coarse sentiment.
+    (Keyword heuristic on titles; simple but works as a signal.)
+    """
+    key = _secret("NEWSAPI_KEY")
+    if not key:
+        return None
+
     try:
-        r = requests.get(url, params=params, timeout=12)
+        r = requests.get(
+            "https://newsapi.org/v2/everything",
+            params={
+                "q": "(crypto OR cryptocurrency OR bitcoin OR ethereum)",
+                "language": "en",
+                "sortBy": "publishedAt",
+                "pageSize": 50,
+                "apiKey": key,
+            },
+            timeout=12,
+        )
         r.raise_for_status()
-        payload = r.json()
-        results = payload.get("results") or []
-        titles = []
-        for item in results[:max_items]:
-            title = item.get("title")
-            if isinstance(title, str) and title.strip():
-                titles.append(title.strip())
-        return titles
-    except Exception:
-        return []
+        data = r.json()
 
-def score_headlines_vader(titles: List[str]) -> Optional[float]:
-    """
-    Run VADER on titles and return average normalized score in [0,1].
-    Returns None if no titles.
-    """
-    if not titles:
-        return None
-    scores = []
-    for t in titles:
-        comp = _analyzer.polarity_scores(t).get("compound", 0.0)
-        scores.append(_normalize_score_01(comp))
-    if not scores:
-        return None
-    return float(sum(scores) / len(scores))
+        titles = [a.get("title", "") or "" for a in data.get("articles", [])]
 
-def per_crypto_sentiment(symbol: str) -> Dict[str, Any]:
-    """
-    Build a compact sentiment dict for a coin, using news headlines only (for now).
-    twitter_score and community_score are left as None (placeholders).
-    """
-    titles = fetch_news_titles_for(symbol, max_items=30)
-    news_score = score_headlines_vader(titles)
+        # very lightweight keywords heuristic
+        bulls = ("surge", "rally", "breakout", "record", "up", "bull", "partnership", "approval", "ETF")
+        bears = ("falls", "down", "drop", "hack", "exploit", "lawsuit", "ban", "bear", "liquidation")
 
-    overall = news_score  # for now; later we can aggregate multiple sources
-    return {
-        "twitter_score": None,
-        "news_score": news_score,
-        "community_score": None,
-        "overall": overall,
-        "source": "CryptoPanic+VADER" if news_score is not None else "none",
-    }
+        pos = sum(1 for t in titles if any(w in t.lower() for w in bulls))
+        neg = sum(1 for t in titles if any(w in t.lower() for w in bears))
+        total = max(1, pos + neg)
+        score = (pos - neg) / total
+
+        return {
+            "score": round(score, 3),
+            "summary": _summarize_score(score),
+            "sample_titles": titles[:5],
+            "articles_considered": len(titles),
+            "source": "newsapi",
+        }
+    except Exception as e:
+        return {"score": None, "summary": f"error: {e}", "source": "newsapi"}
+
+# ---------- Bundle ----------
+def build_sentiment_bundle(bases: List[str]) -> dict:
+    """
+    Compose both general and per-symbol sentiment blocks.
+    """
+    general = fetch_newsapi_general()
+    per_symbol = fetch_cryptopanic_per_symbol(bases)
+    return {"general": general, "per_symbol": per_symbol}
