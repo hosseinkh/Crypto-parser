@@ -50,7 +50,8 @@ with st.sidebar:
     st.header("Settings")
 
     default_selection = [
-        s for s in ["INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT"]
+        s for s in ["INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT","BTC/USDT","ETH/USDT","XRP/USDT","SOL/USDT"
+                   ,"ADA/USDT","FET/USDT","AVAX/USDT","LINK/USDT","PENGU/USDT","XTZ/USDT"]
         if s in st.session_state.all_symbols
     ] or ["BTC/USDT","ETH/USDT"]
 
