@@ -104,18 +104,44 @@ def run_scan(selected_symbols: list[str], selected_tfs: list[str], tf_limits: di
 
 
 def pack_snapshot(rows: list[dict]) -> dict:
-    by_symbol: Dict[str, Dict] = {}
+    """
+    Group per-symbol and pack a single JSON snapshot ready to download.
+    Also attaches sentiment (general + per symbol).
+    """
+    from utiles.sentiment import build_sentiment_bundle
+
+    by_symbol: dict[str, dict] = {}
+    bases = set()
+
     for r in rows:
-        sym = r["symbol"]; tf = r["tf"]; blk = r["block"]
+        sym = r["symbol"]           # e.g., "INJ/USDT"
+        base = sym.split("/")[0]    # "INJ"
+        bases.add(base)
+
+        tf = r["tf"]
+        blk = r["block"]
         if sym not in by_symbol:
             by_symbol[sym] = {"symbol": sym, "timeframes": {}}
         by_symbol[sym]["timeframes"][tf] = blk
 
-    return {
+    # Build sentiment once per snapshot
+    sentiment = build_sentiment_bundle(sorted(bases))
+
+    packed = {
         "generated_at_utc": now_utc_iso(),
+        "sentiment": sentiment,                    # <— now included
         "symbols": list(by_symbol.values()),
-        "meta": {"source": "bitget", "note": "LLM-friendly JSON snapshot"},
+        "meta": {
+            "source": "bitget",
+            "note": "LLM-friendly JSON snapshot",
+            "how_to_read": (
+                "Use 'sentiment.general' for broad market tone, "
+                "'sentiment.per_symbol[SYMBOL/USDT]' for coin-level tone. "
+                "'symbols[].timeframes[tf]' holds candles + indicators."
+            ),
+        },
     }
+    return packed
 
 
 # -----------------------------
