@@ -1,327 +1,378 @@
 # streamlit_app.py
+# --- Professional Snapshot Builder with "Discover Trendy" & Autocomplete ---
 from __future__ import annotations
 
-import json
+import os
 import math
+import json
 import time
+import typing as t
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import requests
 
-from utiles.bitget import (
-    list_symbols_bitget,
-    klines_bitget,
-    TIMEFRAME_MAP,
-    now_utc_iso,
-)
-from utiles.ticks import augment_with_ticks, augment_many_with_ticks
+# ==== Your local project imports (unchanged names assumed) ====
+# Each exchange module must expose:
+#   - name: str
+#   - list_spot_symbols() -> list[str]
+#   - fetch_ohlcv(symbol: str, timeframe: str, limit: int) -> pd.DataFrame with columns:
+#         ["timestamp","open","high","low","close","volume"]
+#   - fetch_last_price(symbol: str) -> float
+#
+# You said Bitget is already updated; keep the others similar.
+from utils.exchanges import bitget, binance, bybit  # adapt to your repo layout
 
-APP_TITLE = "Professional Snapshot Builder"
-DEFAULT_TIMEFRAME = "15m"
-CANDLE_LIMIT = 240
-MAX_SCAN_SYMBOLS = 120
+# ----------------------------- Config -----------------------------
+EXCHANGES = {
+    "Bitget": bitget,
+    "Binance": binance,
+    "Bybit": bybit,
+}
+TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h"]
+DEFAULT_TF = "15m"
 
-# ===== Indicators =====
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
-    close = df["close"].astype(float)
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    vol = df["volume"].astype(float)
+NEWS_API_KEY = os.getenv("CRYPTOPANIC_API_KEY", "").strip()  # optional
+NEWS_WEIGHT = 0.15  # small boost if there is fresh news
+
+# ----------------------------- Helpers -----------------------------
+@dataclass
+class SymbolSnapshot:
+    exchange: str
+    symbol: str
+    timeframe: str
+    candles: int
+    last_price: float
+    indicators: dict
+    structure: dict
+    meta: dict
+
+
+def _ta(df: pd.DataFrame) -> dict:
+    """Compute light indicators used by the framework."""
+    out: dict[str, t.Any] = {}
+    close = df["close"].astype(float).values
+    high = df["high"].astype(float).values
+    low = df["low"].astype(float).values
+    vol = df["volume"].astype(float).values
 
     def sma(x, n):
-        return pd.Series(x).rolling(n).mean()
+        if len(x) < n: 
+            return np.full_like(x, np.nan, dtype=float)
+        s = pd.Series(x, dtype="float64").rolling(n).mean().to_numpy()
+        return s
 
+    ma5 = sma(close, 5)
+    ma10 = sma(close, 10)
+    out["ma5"] = float(ma5[-1]) if not math.isnan(ma5[-1]) else np.nan
+    out["ma10"] = float(ma10[-1]) if not math.isnan(ma10[-1]) else np.nan
+
+    # RSI(14)
     def rsi(x, n=14):
-        x = pd.Series(x)
-        delta = x.diff()
-        up = delta.clip(lower=0)
-        down = -1 * delta.clip(upper=0)
-        ma_up = up.rolling(n).mean()
-        ma_down = down.rolling(n).mean()
-        rs = ma_up / ma_down.replace(0, np.nan)
-        out = 100 - (100 / (1 + rs))
-        return out
+        if len(x) < n + 1:
+            return np.full_like(x, np.nan, dtype=float)
+        delta = np.diff(x)
+        up = np.clip(delta, 0, None)
+        down = -np.clip(delta, None, 0)
+        roll_up = pd.Series(up).rolling(n).mean()
+        roll_down = pd.Series(down).rolling(n).mean()
+        rs = roll_up / (roll_down + 1e-12)
+        r = 100 - (100 / (1 + rs))
+        r = np.concatenate([np.full(1, np.nan), r.to_numpy()])
+        return r
 
-    def atr(h, l, c, n=14):
-        c_shift = c.shift(1)
-        tr = pd.concat([(h - l).abs(), (h - c_shift).abs(), (l - c_shift).abs()], axis=1).max(axis=1)
-        return tr.rolling(n).mean()
+    rsi14 = rsi(close, 14)
+    out["rsi14"] = float(rsi14[-1]) if not math.isnan(rsi14[-1]) else np.nan
 
-    df["ma20"] = sma(close, 20)
-    df["ma50"] = sma(close, 50)
-    df["ma200"] = sma(close, 200)
-    df["rsi14"] = rsi(close, 14)
-    df["atr14"] = atr(high, low, close, 14)
+    # 20-period high/low and distances (breakout context)
+    look = 20 if len(high) >= 20 else len(high)
+    hh = np.max(high[-look:]) if look else np.nan
+    ll = np.min(low[-look:]) if look else np.nan
+    last = close[-1]
+    out["hh20"] = float(hh)
+    out["ll20"] = float(ll)
+    out["dist_to_high"] = float((hh - last) / hh * 100) if hh and hh > 0 else np.nan
+    out["dist_to_low"] = float((last - ll) / ll * 100) if ll and ll > 0 else np.nan
 
-    vol_ma = vol.rolling(50).mean()
-    vol_sd = vol.rolling(50).std(ddof=0)
-    df["vol_z"] = (vol - vol_ma) / vol_sd.replace(0, np.nan)
-    return df
+    # Volume z-score (last vs 20)
+    v_look = 20 if len(vol) >= 20 else len(vol)
+    if v_look >= 3:
+        v_mean = float(np.mean(vol[-v_look:]))
+        v_std = float(np.std(vol[-v_look:], ddof=1))
+        out["vol_z"] = float((vol[-1] - v_mean) / (v_std + 1e-12))
+    else:
+        out["vol_z"] = np.nan
 
-def last_price(df: pd.DataFrame) -> float:
-    return float(df["close"].iloc[-1]) if not df.empty else float("nan")
+    # 24h momentum proxy (close vs close 96 bars back on 15m ⇒ 24h)
+    back = 96 if len(close) >= 97 and out.get("hh20") else min(len(close) - 1, 96)
+    if back > 0:
+        out["mom_24h"] = float((last / close[-1 - back] - 1) * 100)
+    else:
+        out["mom_24h"] = np.nan
 
-def trend_score(df: pd.DataFrame) -> Tuple[float, Dict[str, float]]:
-    if df.empty or len(df) < 210:
-        return 0.0, {}
-    last = df.iloc[-1]; prev = df.iloc[-2]
-    structure = 1.0 if (last["close"] > last["ma20"] > last["ma50"]) else 0.0
-    slope_raw = 0.0
-    if pd.notna(prev["ma20"]) and prev["ma20"] != 0:
-        slope_raw = (last["ma20"] - prev["ma20"]) / prev["ma20"]
-    slope20 = max(0.0, min(1.0, float(slope_raw) * 100))
-    rsi = float(last["rsi14"]) if pd.notna(last["rsi14"]) else float("nan")
-    if math.isnan(rsi):
-        rsi_part = 0.0
-    elif rsi < 45: rsi_part = 0.2
-    elif 45 <= rsi <= 65: rsi_part = 1.0
-    elif 65 < rsi <= 72: rsi_part = 0.6
-    else: rsi_part = 0.2
-    volz = float(last["vol_z"]) if pd.notna(last["vol_z"]) else float("nan")
-    vol_part = 1.0 if (not math.isnan(volz) and volz > 0) else 0.4
-    prem = 0.0
-    if pd.notna(last["ma20"]) and last["ma20"] != 0:
-        prem = (last["close"] - last["ma20"]) / last["ma20"]
-    prem_part = 1.0 if 0 < prem < 0.02 else 0.5 if prem >= 0.02 else 0.2
-    score = (0.30*structure + 0.20*slope20 + 0.25*rsi_part + 0.15*vol_part + 0.10*prem_part) * 100.0
-    explain = {
-        "structure": round(structure, 3),
-        "slope20": round(slope20, 3),
-        "rsi14": round(rsi, 2) if not math.isnan(rsi) else float("nan"),
-        "vol_z": round(volz, 2) if not math.isnan(volz) else float("nan"),
-        "premium_to_ma20": round(prem, 4),
-    }
-    return float(score), explain
+    return out
 
-def sentiment_boost(symbol: str) -> float:
-    return 0.5
 
-# ===== State =====
-def init_state():
-    if "symbols" not in st.session_state:
-        st.session_state.symbols = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-    if "universe" not in st.session_state:
-        st.session_state.universe = []
-    if "last_universe_refresh" not in st.session_state:
-        st.session_state.last_universe_refresh = 0
+def _structure_from_ta(ind: dict) -> dict:
+    """Light structure signals used both for discovery & snapshot table."""
+    ma_ok = ind.get("ma5", np.nan) > ind.get("ma10", np.nan)
+    rsi_ok = 30 < ind.get("rsi14", 50) < 75
+    near_break = ind.get("dist_to_high", np.inf) <= 0.5  # within 0.5% of 20-bar high
+    trend = "UP" if ma_ok else "DOWN"
+    bias = (
+        "breakout"
+        if near_break and ma_ok
+        else "pullback-long" if ma_ok and not near_break and rsi_ok
+        else "avoid"
+    )
+    return {"trend": trend, "bias": bias}
 
-# ===== UI Helpers =====
-def sidebar_controls():
-    st.sidebar.header("⚙️ Settings")
-    quote = st.sidebar.selectbox("Quote", ["USDT", "USDC", "BTC"], index=0)
-    timeframe = st.sidebar.selectbox("Timeframe (scan & snapshot)", ["15m", "1h", "4h"], index=0)
-    max_scan = st.sidebar.slider("Max symbols to scan", 20, MAX_SCAN_SYMBOLS, 60, 10)
-    top_k = st.sidebar.slider("Add top N trending", 5, 40, 15, 1)
-    return quote, timeframe, max_scan, top_k
 
-def refresh_universe(quote: str):
-    with st.spinner("Fetching tradable symbols…"):
-        uni = list_symbols_bitget(quote)
-        st.session_state.universe = uni
-        st.session_state.last_universe_refresh = time.time()
+def _news_boost(symbol: str) -> float:
+    """Optional: tiny score boost if CryptoPanic has fresh headlines for this ticker."""
+    if not NEWS_API_KEY:
+        return 0.0
+    try:
+        # naive: search by symbol (many exchanges share tickers; this is intentionally light)
+        url = "https://cryptopanic.com/api/v1/posts/"
+        params = {"auth_token": NEWS_API_KEY, "currencies": symbol.split("/")[0], "public": "true"}
+        r = requests.get(url, params=params, timeout=6)
+        if r.ok and r.json().get("results"):
+            return NEWS_WEIGHT
+    except Exception:
+        pass
+    return 0.0
 
-def ui_symbol_manager(quote: str):
-    st.subheader("🧰 Symbol Manager")
-    if not st.session_state.universe:
-        refresh_universe(quote)
-    c1, c2 = st.columns([3, 1])
-    with c1:
-        add_syms = st.multiselect(
-            "Add symbols (type to search):",
-            options=st.session_state.universe,
-            default=[],
-            help="Start typing, e.g., 'ARB/USDT'."
-        )
-    with c2:
-        st.write("")
-        if st.button("🔄 Refresh"):
-            refresh_universe(quote)
-    if st.button("➕ Add selected"):
-        added = 0
-        for s in add_syms:
-            if s not in st.session_state.symbols:
-                st.session_state.symbols.append(s); added += 1
-        st.success(f"Added {added} symbols. Total: {len(st.session_state.symbols)}")
-    if st.session_state.symbols:
-        rem = st.multiselect("Remove symbols:", options=st.session_state.symbols, default=[])
-        if st.button("🗑️ Remove selected"):
-            st.session_state.symbols = [s for s in st.session_state.symbols if s not in rem]
-            st.success("Removed.")
-    st.caption(f"Current list: {', '.join(st.session_state.symbols)}")
 
-def scan_trending(universe: List[str], timeframe: str, cap: int) -> pd.DataFrame:
-    if not universe:
-        return pd.DataFrame()
-    uni = universe[:cap]
-    rows = []
-    prog = st.progress(0.0, text="Scanning market…")
-    for i, sym in enumerate(uni, 1):
+def score_trendy(df: pd.DataFrame, ind: dict, symbol: str) -> float:
+    """Composite score for 'Discover Trendy'."""
+    score = 0.0
+    # MA alignment
+    if ind.get("ma5", np.nan) > ind.get("ma10", np.nan):
+        score += 0.35
+    # Near breakout
+    dth = ind.get("dist_to_high", np.inf)
+    if not math.isnan(dth):
+        score += max(0.0, 0.35 * max(0.0, (0.5 - dth) / 0.5))  # linear if within 0.5%
+    # Volume surge
+    vz = ind.get("vol_z", 0.0)
+    if not math.isnan(vz):
+        score += 0.2 * max(0.0, min(vz / 2.5, 1.0))  # cap at z=2.5
+    # RSI sweet spot
+    rsi = ind.get("rsi14", 50)
+    if 40 <= rsi <= 65:
+        score += 0.1
+    # Optional tiny news boost
+    score += _news_boost(symbol)
+    return float(score)
+
+
+def build_snapshot_for_symbols(ex_mod, symbols: list[str], timeframe: str, limit: int) -> list[SymbolSnapshot]:
+    rows: list[SymbolSnapshot] = []
+    for sym in symbols:
         try:
-            df = klines_bitget(sym, timeframe, CANDLE_LIMIT)
-            if df.empty:
+            df = ex_mod.fetch_ohlcv(sym, timeframe=timeframe, limit=limit)
+            if df is None or len(df) == 0:
                 continue
-            df = add_indicators(df)
-            score_tech, explain = trend_score(df)
-            sboost = sentiment_boost(sym)
-            final = 0.8*score_tech + 20*sboost
-            rows.append({
-                "symbol": sym,
-                "last": last_price(df),
-                "score": round(final, 2),
-                "tech_score": round(score_tech, 2),
-                "sentiment": round(sboost, 2),
-                **explain
-            })
-        except Exception:
-            pass
-        if i % 5 == 0 or i == len(uni):
-            prog.progress(min(1.0, i/len(uni)))
-    prog.empty()
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values(["score", "tech_score"], ascending=False).reset_index(drop=True)
-
-def ui_scan_and_add(timeframe: str, max_scan: int, top_k: int):
-    st.subheader("📈 Scan Trending")
-    st.caption("Ranks symbols (tech + sentiment stub). Auto-adds top results to your list if you want.")
-    c1, c2 = st.columns([1, 1])
-    with c1:
-        run = st.button("🚀 Scan Trending Now")
-    with c2:
-        auto_add = st.checkbox("Auto-add top results", value=True)
-    if run:
-        df = scan_trending(st.session_state.universe, timeframe, max_scan)
-        if df.empty:
-            st.warning("No results. Try increasing Max symbols to scan or change timeframe."); return
-        st.dataframe(df.head(top_k), use_container_width=True)
-        if auto_add:
-            candidates = list(df.head(top_k)["symbol"].values); added = 0
-            for s in candidates:
-                if s not in st.session_state.symbols:
-                    st.session_state.symbols.append(s); added += 1
-            st.success(f"Added {added} symbols to your list.")
-
-# ===== Snapshot build & pack =====
-def pack_snapshot_from_rows(rows: List[Dict]) -> Dict:
-    return {
-        "meta": {
-            "built_at": now_utc_iso(),
-            "timeframe": DEFAULT_TIMEFRAME,
-            "note": "Closed-candle indicators; per-symbol 'tick' is attached at download time."
-        },
-        "symbols": rows,
-    }
-
-def build_snapshot(symbols: List[str], timeframe: str) -> tuple[Dict, pd.DataFrame]:
-    table = []; rows_for_json = []
-    if not symbols:
-        return {"meta": {}, "symbols": []}, pd.DataFrame()
-    prog = st.progress(0.0, text="Building snapshot…")
-    for i, sym in enumerate(symbols, 1):
-        try:
-            df = klines_bitget(sym, timeframe, CANDLE_LIMIT)
-            df = add_indicators(df)
-            last = df.iloc[-1] if not df.empty else None
-            rows_for_json.append({
-                "symbol": sym,
-                "tf": timeframe,
-                "last_closed": {
-                    "t": str(df["time"].iloc[-1]) if not df.empty else "",
-                    "o": float(df["open"].iloc[-1]) if not df.empty else float("nan"),
-                    "h": float(df["high"].iloc[-1]) if not df.empty else float("nan"),
-                    "l": float(df["low"].iloc[-1]) if not df.empty else float("nan"),
-                    "c": float(df["close"].iloc[-1]) if not df.empty else float("nan"),
-                    "v": float(df["volume"].iloc[-1]) if not df.empty else float("nan"),
-                },
-                "indicators": {
-                    "ma20": float(last["ma20"]) if last is not None else float("nan"),
-                    "ma50": float(last["ma50"]) if last is not None else float("nan"),
-                    "ma200": float(last["ma200"]) if last is not None else float("nan"),
-                    "rsi14": float(last["rsi14"]) if last is not None else float("nan"),
-                    "atr14": float(last["atr14"]) if last is not None else float("nan"),
-                    "vol_z": float(last["vol_z"]) if last is not None else float("nan"),
-                }
-            })
-            table.append({
-                "symbol": sym,
-                "last_close": float(df["close"].iloc[-1]) if not df.empty else float("nan"),
-                "rsi14": round(float(last["rsi14"]), 2) if last is not None else float("nan"),
-                "ma20": round(float(last["ma20"]), 6) if last is not None else float("nan"),
-                "ma50": round(float(last["ma50"]), 6) if last is not None else float("nan"),
-                "ma200": round(float(last["ma200"]), 6) if last is not None else float("nan"),
-                "atr14": round(float(last["atr14"]), 6) if last is not None else float("nan"),
-                "vol_z": round(float(last["vol_z"]), 2) if last is not None else float("nan"),
-            })
+            # ensure correct dtypes
+            for c in ("open", "high", "low", "close", "volume"):
+                df[c] = pd.to_numeric(df[c], errors="coerce")
+            ind = _ta(df)
+            struct = _structure_from_ta(ind)
+            last_price = float(ex_mod.fetch_last_price(sym))  # capture at snapshot time
+            snap = SymbolSnapshot(
+                exchange=ex_mod.name,
+                symbol=sym,
+                timeframe=timeframe,
+                candles=limit,
+                last_price=last_price,
+                indicators=ind,
+                structure=struct,
+                meta={"rows": int(len(df)), "generated_at": datetime.now(timezone.utc).isoformat()},
+            )
+            rows.append(snap)
         except Exception as e:
-            table.append({"symbol": sym, "error": str(e)})
-        prog.progress(min(1.0, i/len(symbols)))
-    prog.empty()
-    packed = pack_snapshot_from_rows(rows_for_json)
-    return packed, pd.DataFrame(table)
+            st.warning(f"⚠️ {sym}: {e}")
+    return rows
 
-# ===== App =====
-def main():
-    st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
-    init_state()
-    st.title(APP_TITLE)
-    st.caption("Type to add symbols • Scan trending • Build a JSON snapshot that includes the **last price at snapshot time** for each coin.")
 
-    quote, timeframe, max_scan, top_k = sidebar_controls()
-    ui_symbol_manager(quote); st.divider()
-    ui_scan_and_add(timeframe, max_scan, top_k); st.divider()
+def pack_snapshot_from_rows(rows: list[SymbolSnapshot]) -> dict:
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "count": len(rows),
+        "items": [],
+    }
+    for r in rows:
+        payload["items"].append(
+            {
+                "exchange": r.exchange,
+                "symbol": r.symbol,
+                "timeframe": r.timeframe,
+                "candles": r.candles,
+                "last_price": r.last_price,
+                "ind": r.indicators,
+                "struct": r.structure,
+                "meta": r.meta,
+            }
+        )
+    return payload
 
-    st.subheader("🧪 Build Snapshot")
-    c1, c2, c3 = st.columns([1, 1, 2])
-    with c1:
-        split_output = st.checkbox("Split output", value=False)
-    with c2:
-        max_per_file = st.number_input("Max symbols per file", min_value=10, max_value=500, value=120, step=10)
-    with c3:
-        build_btn = st.button("🧱 Build Snapshot", use_container_width=True)
 
-    if build_btn:
-        if not st.session_state.symbols:
-            st.warning("Your symbol list is empty. Add symbols first."); return
-        packed, df = build_snapshot(st.session_state.symbols, timeframe)
+def pack_snapshot_chunked(rows: list[SymbolSnapshot], max_per_file: int) -> list[dict]:
+    out = []
+    for i in range(0, len(rows), max_per_file):
+        out.append(pack_snapshot_from_rows(rows[i : i + max_per_file]))
+    return out
 
-        # Preview
-        try: st.dataframe(df, use_container_width=True)
-        except Exception: st.table(df)
 
+# ----------------------------- UI -----------------------------
+st.set_page_config(page_title="Professional Snapshot Builder", layout="wide")
+st.title("📈 Professional Snapshot Builder")
+
+with st.sidebar:
+    st.subheader("Settings")
+
+    ex_name = st.selectbox("Exchange", list(EXCHANGES.keys()), index=0)
+    ex_mod = EXCHANGES[ex_name]
+
+    timeframe = st.selectbox("Timeframe", TIMEFRAMES, index=TIMEFRAMES.index(DEFAULT_TF))
+    limit = st.slider("Candles per symbol", min_value=200, max_value=2000, value=1300, step=50)
+
+    # --- Symbol picker with auto-suggest ---
+    with st.expander("Symbols (picker)", expanded=True):
+        try:
+            all_syms = ex_mod.list_spot_symbols()
+        except Exception:
+            all_syms = []
+            st.warning("Could not fetch symbols from the exchange module.")
+
+        default_list = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT"]
+        universe = st.multiselect(
+            "Choose symbols (search or paste):",
+            options=all_syms,
+            default=[s for s in default_list if s in all_syms] or default_list,
+            help="Type to search. You can paste more symbols and press Enter.",
+        )
+
+        # Free-text additions (one per line)
+        extra = st.text_area("Or add more (one per line, e.g., DOT/USDT)", height=90, placeholder="DOT/USDT\nLINK/USDT")
+        if extra.strip():
+            universe += [s.strip().upper() for s in extra.splitlines() if s.strip()]
+
+    st.markdown("---")
+    st.caption("🔎 Discover coins that are currently trending (framework + scalp filter).")
+    colA, colB = st.columns([1, 1])
+    with colA:
+        top_n = st.number_input("How many to add?", min_value=5, max_value=40, value=12, step=1)
+    with colB:
+        do_discover = st.button("✨ Discover Trendy", use_container_width=True)
+
+# --- Discover Trendy ---
+if do_discover:
+    with st.spinner("Scanning universe for trending candidates..."):
+        try:
+            scan_list = all_syms if all_syms else universe
+            scored: list[tuple[str, float]] = []
+            # light/thrifty pass: fewer candles just for scoring speed
+            scan_limit = max(120, min(400, limit // 6))
+            for sym in scan_list:
+                try:
+                    ddf = ex_mod.fetch_ohlcv(sym, timeframe=timeframe, limit=scan_limit)
+                    if ddf is None or len(ddf) < 60:
+                        continue
+                    for c in ("open", "high", "low", "close", "volume"):
+                        ddf[c] = pd.to_numeric(ddf[c], errors="coerce")
+                    ind = _ta(ddf)
+                    # scalp filtering: MA alignment, RSI in tradable band, vol z positive
+                    scalp_ok = (
+                        ind.get("ma5", np.nan) > ind.get("ma10", np.nan)
+                        and 35 < ind.get("rsi14", 50) < 72
+                        and ind.get("vol_z", 0) > -0.3
+                    )
+                    if not scalp_ok:
+                        continue
+                    s = score_trendy(ddf, ind, sym)
+                    scored.append((sym, s))
+                except Exception:
+                    continue
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            picked = [s for s, _ in scored[: int(top_n)]]
+            st.success(f"Found {len(picked)} trendy candidates.")
+            if picked:
+                st.write(", ".join(picked))
+                # merge into universe (unique, keep order)
+                seen = set(universe)
+                universe.extend([p for p in picked if p not in seen])
+        except Exception as e:
+            st.error(f"Discovery error: {e}")
+
+# --- Build snapshot ---
+st.markdown("### Build")
+build = st.button("🧱 Build Snapshot", type="primary")
+
+if build:
+    with st.spinner("Building snapshot..."):
+        t0 = time.time()
+        rows = build_snapshot_for_symbols(ex_mod, universe, timeframe, limit)
+        took = time.time() - t0
+        st.success(f"Built {len(rows)} items in {took:.1f}s.")
+
+        # Table preview
+        table = []
+        for r in rows:
+            ind, struct = r.indicators, r.structure
+            table.append(
+                {
+                    "symbol": r.symbol,
+                    "last": r.last_price,
+                    "trend": struct.get("trend", "?"),
+                    "bias": struct.get("bias", "?"),
+                    "ma5": round(ind.get("ma5", float("nan")), 6),
+                    "ma10": round(ind.get("ma10", float("nan")), 6),
+                    "rsi14": round(ind.get("rsi14", float("nan")), 2),
+                    "dist_to_high%": round(ind.get("dist_to_high", float("nan")), 3),
+                    "vol_z": round(ind.get("vol_z", float("nan")), 2),
+                    "mom_24h%": round(ind.get("mom_24h", float("nan")), 2),
+                }
+            )
+        df = pd.DataFrame(table)
+
+        try:
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        except Exception:
+            st.table(df)
+
+        # === Downloads ===
         ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        split_output = st.toggle("Split into multiple files", value=False)
+        max_per_file = st.number_input("Max symbols per file", min_value=10, max_value=100, value=40, step=5)
+
         if split_output:
-            # chunking
-            parts = []; current = []
-            for i, row in enumerate(packed["symbols"], 1):
-                current.append(row)
-                if len(current) >= int(max_per_file) or i == len(packed["symbols"]):
-                    parts.append({"meta": packed["meta"], "symbols": current}); current = []
-            # attach live ticks (captures last price at download time)
-            parts = augment_many_with_ticks(parts)
-            st.write(f"Creating **{len(parts)}** JSON files (max {int(max_per_file)} symbols per file).")
-            for idx, part in enumerate(parts, start=1):
-                as_bytes = json.dumps(part, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            payloads = pack_snapshot_chunked(rows, int(max_per_file))
+            st.write(f"Creating **{len(payloads)}** JSON files (max {int(max_per_file)} symbols per file).")
+            for idx, packed in enumerate(payloads, start=1):
+                as_bytes = json.dumps(packed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
                 st.download_button(
-                    f"⬇️ Download JSON #{idx}", data=as_bytes,
-                    file_name=f"snapshot_{ts}_{idx:02d}.json", mime="application/json", key=f"dl_{idx}",
+                    f"⬇️ Download JSON #{idx}",
+                    data=as_bytes,
+                    file_name=f"snapshot_{ts}_{idx:02d}.json",
+                    mime="application/json",
+                    key=f"dl_{idx}",
                 )
             with st.expander("🔍 Preview first JSON"):
-                st.code(json.dumps(parts[0], indent=2, ensure_ascii=False), language="json")
+                st.code(json.dumps(payloads[0], indent=2, ensure_ascii=False), language="json")
         else:
-            # single file; attach live ticks here too
-            packed = augment_with_ticks(packed)
+            packed = pack_snapshot_from_rows(rows)
             as_bytes = json.dumps(packed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
             st.download_button(
                 "⬇️ Download single JSON snapshot",
-                data=as_bytes, file_name=f"snapshot_{ts}.json", mime="application/json", use_container_width=True,
+                data=as_bytes,
+                file_name=f"snapshot_{ts}.json",
+                mime="application/json",
             )
             with st.expander("🔍 View JSON"):
                 st.code(json.dumps(packed, indent=2, ensure_ascii=False), language="json")
-
-if __name__ == "__main__":
-    main()
