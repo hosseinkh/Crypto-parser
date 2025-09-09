@@ -1,6 +1,6 @@
 # streamlit_app.py
 # Professional Snapshot Builder — type-ahead symbols, stable list, trending scan (tech + sentiment),
-# and snapshot-time last price capture.
+# safe multiselect defaults, and snapshot-time last price capture.
 
 from __future__ import annotations
 
@@ -14,21 +14,20 @@ import pandas as pd
 import streamlit as st
 
 # ========= Optional project sentiment =========
-# We support multiple return shapes:
+# Supported return shapes:
 # - float -> 0.35
 # - dict  -> {"score": 0.35, "label":"bullish"}
 # - tuple -> (0.35, "bullish")
 try:
-    from utils.sentiment import get_symbol_sentiment as _get_symbol_sentiment  # your function
+    from utils.sentiment import get_symbol_sentiment as _get_symbol_sentiment
 except Exception:
     _get_symbol_sentiment = None
 
-def normalize_sentiment(raw: Any) -> Tuple[float, str]:
-    """Normalize sentiment return into (score, label)."""
+def _normalize_sentiment(raw: Any) -> Tuple[float, str]:
     try:
         if isinstance(raw, (int, float)):
             s = float(raw)
-            return s, "bullish" if s > 0.2 else "bearish" if s < -0.2 else "neutral"
+            return s, ("bullish" if s > 0.2 else "bearish" if s < -0.2 else "neutral")
         if isinstance(raw, dict):
             s = float(raw.get("score", 0.0))
             lbl = str(raw.get("label", "neutral"))
@@ -41,21 +40,19 @@ def normalize_sentiment(raw: Any) -> Tuple[float, str]:
         pass
     return 0.0, "neutral"
 
-def get_symbol_sentiment(symbol: str) -> Tuple[float, str]:
-    """Safe wrapper to call user's sentiment function if present."""
+def get_symbol_sentiment(symbol: string) -> Tuple[float, str]:
     if _get_symbol_sentiment is None:
         return 0.0, "neutral"
     try:
-        # Many users pass "BTC", your universe uses "BTC/USDT" → strip suffix if present
         base = symbol.split("/")[0]
-        return normalize_sentiment(_get_symbol_sentiment(base))
+        return _normalize_sentiment(_get_symbol_sentiment(base))
     except Exception:
         return 0.0, "neutral"
 
 
-# ========= Exchange via CCXT (self-contained; no local utils required) =======
+# ========= Exchange via CCXT (self-contained) =======
 try:
-    import ccxt  # ensure requirements.txt has ccxt
+    import ccxt  # ensure in requirements.txt
 except Exception as e:
     st.error(f"Missing dependency: ccxt ({e}). Add `ccxt` to requirements.txt.")
     st.stop()
@@ -80,35 +77,34 @@ def make_exchange(name: str):
     klass = EXCHANGES.get(name)
     if not klass:
         raise ValueError(f"Unsupported exchange {name}")
-    return klass({"enableRateLimit": True})
-
+    ex = klass({"enableRateLimit": True})
+    ex.load_markets()
+    return ex
 
 @st.cache_data(show_spinner=False, ttl=300)
-def load_usdt_symbols(exchange: str) -> List[str]:
-    ex = make_exchange(exchange)
-    ex.load_markets()
+def load_usdt_symbols(ex_name: str) -> List[str]:
+    ex = make_exchange(ex_name)
     syms = []
     for m in ex.markets.values():
         if not m.get("active", True):
             continue
-        if (m.get("type") == "spot" or m.get("spot") is True) and (m.get("quote") == "USDT"):
+        if (m.get("type") == "spot" or m.get("spot") is True) and (str(m.get("quote")).upper() == "USDT"):
             syms.append(m["symbol"])
     return sorted(list(dict.fromkeys(syms)))
 
 
 def safe_fetch_ohlcv(ex, symbol: str, timeframe: str, limit: int) -> List[List[float]]:
-    tries, last = 2, None
-    for _ in range(tries):
+    last = None
+    for _ in range(2):
         try:
             return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         except Exception as e:
             last = e
     raise last
 
-
 def safe_fetch_ticker(ex, symbol: str) -> Dict[str, Any]:
-    tries, last = 2, None
-    for _ in range(tries):
+    last = None
+    for _ in range(2):
         try:
             return ex.fetch_ticker(symbol)
         except Exception as e:
@@ -116,7 +112,7 @@ def safe_fetch_ticker(ex, symbol: str) -> Dict[str, Any]:
     raise last
 
 
-# ========= Indicators (compact, reliable) ====================================
+# ========= Indicators (compact) =========
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     up = delta.clip(lower=0.0)
@@ -138,28 +134,24 @@ def pct_change(new: float, old: float) -> float:
     return (new - old) / old * 100.0
 
 
-# ========= Trending scan (tech + sentiment) ==================================
+# ========= Scan (tech + sentiment) =========
 def compute_scan_metrics(df: pd.DataFrame, tf: str) -> Dict[str, float]:
-    """Return 4h momentum, 24h volume z-score (approx), RSI14 (tf)."""
     df = df.sort_values("timestamp").reset_index(drop=True)
     close = df["close"]
     vol = df["volume"]
 
-    # 4h momentum in % (approx bars)
     bars_per_4h = 16 if tf.endswith("m") and tf != "60m" else (4 if tf.endswith("h") else 16)
     if len(close) > bars_per_4h:
         m4 = pct_change(float(close.iloc[-1]), float(close.iloc[-bars_per_4h-1]))
     else:
         m4 = np.nan
 
-    # 24h volume z-score on the selected TF (approx bars)
     bars_per_24h = 96 if tf.endswith("m") and tf != "60m" else (24 if tf.endswith("h") else 30)
     vol_window = vol.tail(min(len(vol), bars_per_24h))
     vz = float(zscore(vol_window, max(5, min(50, len(vol_window)))).iloc[-1]) if len(vol_window) >= 5 else 0.0
 
     r = float(rsi(close, 14).iloc[-1])
     return {"pct4h": m4, "vol_z24h": vz, "rsi14": r}
-
 
 def scan_trending(ex, universe: List[str], timeframe: str,
                   min_pct_4h: float, min_vol_z: float,
@@ -171,7 +163,6 @@ def scan_trending(ex, universe: List[str], timeframe: str,
 
     for sym in universe:
         try:
-            # use a modest limit for speed
             ohlcv = safe_fetch_ohlcv(ex, sym, timeframe=timeframe, limit=400)
             if not ohlcv or len(ohlcv) < 60:
                 continue
@@ -192,7 +183,6 @@ def scan_trending(ex, universe: List[str], timeframe: str,
             }
             rows.append(row)
 
-            # gates
             tech_ok = (
                 (met["pct4h"] == met["pct4h"] and met["pct4h"] >= min_pct_4h) and
                 (met["vol_z24h"] >= min_vol_z) and
@@ -210,7 +200,7 @@ def scan_trending(ex, universe: List[str], timeframe: str,
     return df_out, passing
 
 
-# ========= Snapshot packing ===================================================
+# ========= Snapshot packing =========
 def last_price_snapshot(ex, symbol: str, fallback_close: float) -> float:
     try:
         t = safe_fetch_ticker(ex, symbol)
@@ -223,14 +213,14 @@ def last_price_snapshot(ex, symbol: str, fallback_close: float) -> float:
 
 def build_snapshot(ex_name: str, tf: str, symbols: List[str], limit: int) -> Dict[str, Any]:
     ex = make_exchange(ex_name)
-    rows = []
-    errors = []
+    rows, errors = [], []
 
     for sym in symbols:
         try:
             ohlcv = safe_fetch_ohlcv(ex, sym, tf, limit=limit)
             df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
             lp = last_price_snapshot(ex, sym, float(df["close"].iloc[-1]))
+
             rows.append({
                 "symbol": sym,
                 "timeframe": tf,
@@ -248,21 +238,20 @@ def build_snapshot(ex_name: str, tf: str, symbols: List[str], limit: int) -> Dic
         except Exception as e:
             errors.append((sym, str(e)))
 
-    payload = {
+    return {
         "meta": {
             "exchange": ex_name,
             "timeframe": tf,
             "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "notes": "last = snapshot-time price (from ticker.last if available, else last close)",
+            "notes": "last = snapshot-time price (ticker.last if available, else last close)",
             "count": len(rows),
         },
         "rows": rows,
         "errors": errors,
     }
-    return payload
 
 
-# ========= UI ================================================================
+# ========= UI =========
 st.set_page_config(page_title="Professional Snapshot Builder", page_icon="📈", layout="wide")
 st.title("📈 Professional Snapshot Builder")
 
@@ -274,21 +263,29 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Symbols")
-    # Suggestions (type-ahead) from exchange markets
+
+    # Load exchange symbols (may be empty on API hiccups)
     try:
         all_usdt = load_usdt_symbols(ex_name)
     except Exception as e:
         all_usdt = []
         st.warning(f"Could not load markets: {e}")
 
-    # Working list persisted in session
+    # Initialize working list once
     if "working_symbols" not in st.session_state:
         st.session_state.working_symbols = SAFE_STABLE.copy()
 
+    # ---- SAFE MULTISELECT (fixes the Streamlit default-in-options error) ----
+    # Build options = union(exchange options, current defaults) so every default is valid.
+    raw_options = all_usdt if all_usdt else []
+    options_union = list(dict.fromkeys(raw_options + st.session_state.working_symbols))
+    if not options_union:
+        options_union = SAFE_STABLE.copy()  # final fallback
+
     st.session_state.working_symbols = st.multiselect(
         "Edit list (type to search)",
-        options=all_usdt if all_usdt else SAFE_STABLE,
-        default=st.session_state.working_symbols,
+        options=options_union,
+        default=st.session_state.working_symbols,  # guaranteed to be in options
         placeholder="Start typing e.g. BTC/USDT…",
     )
 
@@ -303,18 +300,19 @@ with st.sidebar:
     do_scan = colX.button("🔎 Scan & Show")
     add_pass = colY.button("➕ Add Passing to List")
 
-# Scan results container
+# Scan results
 scan_df: pd.DataFrame | None = None
 scan_pass: List[str] = []
 
 if do_scan:
     ex = make_exchange(ex_name)
+    # scan the larger universe if available; otherwise scan current list
     source = all_usdt if all_usdt else st.session_state.working_symbols
     with st.spinner("Scanning universe…"):
         scan_df, scan_pass = scan_trending(
             ex,
             universe=source,
-            timeframe=tf if tf in ("15m","1h","4h") else "15m",
+            timeframe=(tf if tf in ("15m","1h","4h") else "15m"),
             min_pct_4h=float(min_pct_4h),
             min_vol_z=float(min_vol_z),
             rsi_bounds=(int(rsi_low), int(rsi_high)),
@@ -330,11 +328,11 @@ if do_scan:
             use_container_width=True,
             hide_index=True,
         )
-        st.write("**Pass (tech+sentiment):**", scan_pass)
+        st.write("**Pass (tech+sentiment):**", scan_pass if scan_pass else "None")
 
 if add_pass and scan_pass:
     merged = st.session_state.working_symbols + [s for s in scan_pass if s not in st.session_state.working_symbols]
-    # ensure SAFE_STABLE always included
+    # always include SAFE_STABLE
     merged = list(dict.fromkeys(SAFE_STABLE + merged))
     st.session_state.working_symbols = merged
     st.success(f"Added {len(scan_pass)} symbols. Total now: {len(st.session_state.working_symbols)}")
@@ -345,11 +343,14 @@ st.subheader("📦 Build Snapshot")
 split = st.toggle("Split into multiple files", value=False)
 chunk_n = st.number_input("Max symbols per file", 5, 200, 40, 5, disabled=not split)
 
-build = st.button("🚀 Build Snapshot", type="primary")
-
-def chunk(lst: List[str], n: int) -> List[List[str]]:
+def _chunk(lst: List[str], n: int) -> List[List[str]]:
     return [lst[i:i+n] for i in range(0, len(lst), n)]
 
+def _download_payload(payload: Dict[str, Any], name: str):
+    as_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    st.download_button(name, data=as_bytes, file_name=name.replace("⬇️ ", ""), mime="application/json")
+
+build = st.button("🚀 Build Snapshot", type="primary", use_container_width=True)
 if build:
     syms = st.session_state.working_symbols
     if not syms:
@@ -357,32 +358,19 @@ if build:
         st.stop()
 
     if split:
-        groups = chunk(syms, int(chunk_n))
+        groups = _chunk(syms, int(chunk_n))
         st.info(f"Creating {len(groups)} files…")
         first_payload = None
         for i, grp in enumerate(groups, start=1):
             payload = build_snapshot(ex_name, tf, grp, limit)
             if first_payload is None:
                 first_payload = payload
-            as_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            st.download_button(
-                f"⬇️ Download JSON #{i}",
-                data=as_bytes,
-                file_name=f"snapshot_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{i:02d}.json",
-                mime="application/json",
-                key=f"dl_{i}",
-            )
+            _download_payload(payload, f"⬇️ snapshot_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}_{i:02d}.json")
         if first_payload:
             with st.expander("🔍 Preview first JSON"):
                 st.code(json.dumps(first_payload, indent=2, ensure_ascii=False), language="json")
     else:
         payload = build_snapshot(ex_name, tf, syms, limit)
-        as_bytes = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        st.download_button(
-            "⬇️ Download snapshot JSON",
-            data=as_bytes,
-            file_name=f"snapshot_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json",
-            mime="application/json",
-        )
+        _download_payload(payload, f"⬇️ snapshot_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json")
         with st.expander("🔍 View JSON"):
             st.code(json.dumps(payload, indent=2, ensure_ascii=False), language="json")
