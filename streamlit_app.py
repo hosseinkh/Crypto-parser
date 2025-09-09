@@ -1,6 +1,6 @@
 # streamlit_app.py
 # Professional Snapshot Builder — type-ahead symbols, stable list, trending scan (tech + sentiment),
-# safe multiselect defaults, and snapshot-time last price capture.
+# safe multiselect defaults, snapshot-time last price capture, and SENTIMENT in snapshot.
 
 from __future__ import annotations
 
@@ -40,11 +40,12 @@ def _normalize_sentiment(raw: Any) -> Tuple[float, str]:
         pass
     return 0.0, "neutral"
 
-def get_symbol_sentiment(symbol: string) -> Tuple[float, str]:
+def get_sentiment_for_symbol(symbol: str) -> Tuple[float, str]:
+    """Safe wrapper to call user's sentiment function if present."""
     if _get_symbol_sentiment is None:
         return 0.0, "neutral"
     try:
-        base = symbol.split("/")[0]
+        base = symbol.split("/")[0]  # e.g., "BTC" from "BTC/USDT"
         return _normalize_sentiment(_get_symbol_sentiment(base))
     except Exception:
         return 0.0, "neutral"
@@ -170,7 +171,7 @@ def scan_trending(ex, universe: List[str], timeframe: str,
             met = compute_scan_metrics(df, timeframe)
             last = float(df["close"].iloc[-1])
 
-            s_score, s_label = get_symbol_sentiment(sym)
+            s_score, s_label = get_sentiment_for_symbol(sym)
 
             row = {
                 "symbol": sym,
@@ -200,7 +201,7 @@ def scan_trending(ex, universe: List[str], timeframe: str,
     return df_out, passing
 
 
-# ========= Snapshot packing =========
+# ========= Snapshot packing (with SENTIMENT) =========
 def last_price_snapshot(ex, symbol: str, fallback_close: float) -> float:
     try:
         t = safe_fetch_ticker(ex, symbol)
@@ -214,6 +215,7 @@ def last_price_snapshot(ex, symbol: str, fallback_close: float) -> float:
 def build_snapshot(ex_name: str, tf: str, symbols: List[str], limit: int) -> Dict[str, Any]:
     ex = make_exchange(ex_name)
     rows, errors = [], []
+    s_scores: List[float] = []
 
     for sym in symbols:
         try:
@@ -221,10 +223,23 @@ def build_snapshot(ex_name: str, tf: str, symbols: List[str], limit: int) -> Dic
             df = pd.DataFrame(ohlcv, columns=["timestamp","open","high","low","close","volume"])
             lp = last_price_snapshot(ex, sym, float(df["close"].iloc[-1]))
 
+            # indicators useful for framework
+            rsi14 = float(np.round(rsi(df["close"], 14).iloc[-1], 2))
+            atr14 = float(np.round((df["high"] - df["low"]).rolling(14).mean().iloc[-1], 8))
+            look = min(100, df.shape[0])
+            hh = float(df["high"].tail(look).max())
+            ll = float(df["low"].tail(look).min())
+            dist_to_high = float(np.round((hh - lp) / hh * 100, 4)) if hh else None
+            dist_to_low = float(np.round((lp - ll) / ll * 100, 4)) if ll else None
+
+            # per-symbol sentiment
+            s_score, s_label = get_sentiment_for_symbol(sym)
+            s_scores.append(s_score)
+
             rows.append({
                 "symbol": sym,
                 "timeframe": tf,
-                "last": lp,
+                "last": lp,  # true last at snapshot time
                 "last_candle": {
                     "ts": int(df["timestamp"].iloc[-1]),
                     "open": float(df["open"].iloc[-1]),
@@ -233,10 +248,24 @@ def build_snapshot(ex_name: str, tf: str, symbols: List[str], limit: int) -> Dic
                     "close": float(df["close"].iloc[-1]),
                     "volume": float(df["volume"].iloc[-1]),
                 },
+                "indicators": {
+                    "rsi14": rsi14,
+                    "atr14": atr14,
+                    "dist_to_high": dist_to_high,
+                    "dist_to_low": dist_to_low,
+                },
+                "sentiment": {
+                    "score": float(np.round(s_score, 3)),
+                    "label": s_label,
+                },
                 "asof": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             })
         except Exception as e:
             errors.append((sym, str(e)))
+
+    # meta-level sentiment summary (average)
+    avg_sent = float(np.round(np.nanmean(s_scores), 3)) if s_scores else 0.0
+    avg_label = "bullish" if avg_sent > 0.2 else "bearish" if avg_sent < -0.2 else "neutral"
 
     return {
         "meta": {
@@ -245,6 +274,7 @@ def build_snapshot(ex_name: str, tf: str, symbols: List[str], limit: int) -> Dic
             "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "notes": "last = snapshot-time price (ticker.last if available, else last close)",
             "count": len(rows),
+            "sentiment_summary": {"avg_score": avg_sent, "avg_label": avg_label},
         },
         "rows": rows,
         "errors": errors,
@@ -275,8 +305,7 @@ with st.sidebar:
     if "working_symbols" not in st.session_state:
         st.session_state.working_symbols = SAFE_STABLE.copy()
 
-    # ---- SAFE MULTISELECT (fixes the Streamlit default-in-options error) ----
-    # Build options = union(exchange options, current defaults) so every default is valid.
+    # ---- SAFE MULTISELECT (fixes the default-in-options error) ----
     raw_options = all_usdt if all_usdt else []
     options_union = list(dict.fromkeys(raw_options + st.session_state.working_symbols))
     if not options_union:
