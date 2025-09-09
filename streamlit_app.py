@@ -2,280 +2,282 @@
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import List, Dict
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import streamlit as st
 
-# ---- our utils (folder name: utiles) ----
-from utiles.bitget import make_exchange, normalize_symbol, now_utc_iso
-from utiles import snapshot as snap
-from utiles.sentiment import build_sentiment_bundle  # used for per-file sentiment
+# Project utilities
+from utiles.bitget import make_exchange, normalize_symbol, fetch_ohlcv_df, now_utc_iso
+from utiles.ticks import augment_with_ticks, augment_many_with_ticks
 
 # =========================
-# Page config & session
+# ------- Settings --------
 # =========================
-st.set_page_config(page_title="Crypto Scanner (Bitget) – JSON Snapshot MVP", layout="wide")
 
-if "scan_results" not in st.session_state:
-    st.session_state.scan_results: List[Dict] = []
+DEFAULT_SYMBOLS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT", "LINK/USDT",
+    "INJ/USDT", "GRT/USDT", "FET/USDT", "BNB/USDT", "TRX/USDT",
+    "XRP/USDT", "XTZ/USDT", "CRO/USDT", "PENGU/USDT",  # keep your 14 + pengu if you use it
+]
 
-# Build a full symbol universe once (USDT spot-looking symbols)
-if "all_symbols" not in st.session_state:
-    ex_for_list = make_exchange()
-    ex_for_list.load_markets()
-    candidates: List[str] = []
-    for m in ex_for_list.markets.values():
-        sym = m.get("symbol", "")
-        # keep simple SPOT-looking symbols like "BTC/USDT" (avoid futures like "BTC/USDT:USDT")
-        if "/" in sym and sym.endswith("/USDT") and (":" not in sym) and m.get("active", True):
-            candidates.append(sym)
-
-    # Ensure your favorites exist
-    curated = [
-        "BTC/USDT","ETH/USDT","INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT",
-        "AVAX/USDT","LINK/USDT","XRP/USDT","FET/USDT","SOL/USDT","ADA/USDT",
-        "PENGU/USDT","XTZ/USDT"
-    ]
-    st.session_state.all_symbols = sorted(set(candidates) | set(curated))
-
-if "timeframes" not in st.session_state:
-    st.session_state.timeframes = ["15m", "1h", "4h"]
+TIMEFRAMES = ["15m", "1h", "4h"]
+LIMITS = {"15m": 200, "1h": 200, "4h": 200}  # enough bars for indicators
 
 # =========================
-# UI – controls
+# ---- TA Helper funcs ----
 # =========================
-st.title("🔎 Crypto Scanner (Bitget) – JSON Snapshot MVP")
-st.caption("No keys. No servers. Mobile-friendly. (UTC timestamps)")
+
+def ema(series: pd.Series, period: int) -> pd.Series:
+    return series.ewm(span=period, adjust=False).mean()
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+    rs = gain / loss
+    out = 100 - (100 / (1 + rs))
+    return out
+
+def true_range(high: pd.Series, low: pd.Series, close: pd.Series) -> pd.Series:
+    prev_close = close.shift(1)
+    tr1 = (high - low).abs()
+    tr2 = (high - prev_close).abs()
+    tr3 = (low - prev_close).abs()
+    return pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+def atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+    tr = true_range(high, low, close)
+    return tr.rolling(period).mean()
+
+def zscore(series: pd.Series, window: int = 20) -> pd.Series:
+    mean = series.rolling(window).mean()
+    std = series.rolling(window).std(ddof=0)
+    return (series - mean) / std
+
+# =========================
+# ---- Row Construction ----
+# =========================
+
+@dataclass
+class TFBlock:
+    last_closed: dict
+    indicators: dict
+    structure: dict
+
+def build_symbol_block(ex, symbol: str) -> dict:
+    """
+    Fetch OHLCV for 15m/1h/4h, compute core indicators on CLOSED candles,
+    and return a symbol block ready for JSON packing and table display.
+    """
+    tf_blocks: Dict[str, TFBlock] = {}
+
+    for tf in TIMEFRAMES:
+        df = fetch_ohlcv_df(ex, symbol, tf, LIMITS[tf])
+        if df.empty or len(df) < 30:
+            # not enough data for indicators
+            tf_blocks[tf] = TFBlock(
+                last_closed={}, indicators={}, structure={}
+            )
+            continue
+
+        # last closed candle = row at index -2 (since last row may be still forming)
+        # but in CCXT, the last value returned is typically the latest CLOSED for spot TFs
+        # to be safe, we take the last row as closed (common for fetch_ohlcv); adjust if your exchange differs
+        last = df.iloc[-1].copy()
+
+        # indicators on CLOSED
+        close = df["close"]
+        high = df["high"]
+        low = df["low"]
+        volume = df["volume"]
+
+        ema20 = ema(close, 20)
+        rsi14 = rsi(close, 14)
+        atr14 = atr(high, low, close, 14)
+
+        # volume z-score (simple approach vs 20-bar mean/std)
+        volz = zscore(volume, 20)
+
+        # structure helpers (distance to 20-bar high/low measured from close)
+        dist_to_high = (close - close.rolling(20).max()) / close * 100.0
+        dist_to_low = (close - close.rolling(20).min()) / close * 100.0
+
+        # trend heuristic: slope of EMA20 over last 5 bars
+        slope = ema20.diff(5)
+        trend = "up" if slope.iloc[-1] > 0 else ("down" if slope.iloc[-1] < 0 else "flat")
+
+        tf_blocks[tf] = TFBlock(
+            last_closed={
+                "t": pd.to_datetime(last["ts"]).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "o": float(last["open"]),
+                "h": float(last["high"]),
+                "l": float(last["low"]),
+                "c": float(last["close"]),
+                "v": float(last["volume"]),
+            },
+            indicators={
+                "ema20": float(ema20.iloc[-1]),
+                "rsi14": float(rsi14.iloc[-1]),
+                "atr14": float(atr14.iloc[-1]),
+                "vol_z": float(volz.iloc[-1]) if not math.isnan(volz.iloc[-1]) else float("nan"),
+                "dist_to_high": float(dist_to_high.iloc[-1]) if not math.isnan(dist_to_high.iloc[-1]) else float("nan"),
+                "dist_to_low": float(dist_to_low.iloc[-1]) if not math.isnan(dist_to_low.iloc[-1]) else float("nan"),
+            },
+            structure={
+                "trend": trend
+            }
+        )
+
+    return {
+        "symbol": symbol,
+        "tf": {
+            tf: {
+                "last_closed": tf_blocks[tf].last_closed,
+                "indicators": tf_blocks[tf].indicators,
+                "structure": tf_blocks[tf].structure,
+            } for tf in TIMEFRAMES
+        }
+    }
+
+def build_rows(ex, symbols: List[str]) -> List[dict]:
+    rows = []
+    for s in symbols:
+        sym = normalize_symbol(s)
+        try:
+            rows.append(build_symbol_block(ex, sym))
+        except Exception as e:
+            rows.append({"symbol": sym, "error": str(e), "tf": {}})
+    return rows
+
+# =========================
+# ---- Snapshot packers ----
+# =========================
+
+def pack_snapshot_from_rows(rows: List[dict]) -> dict:
+    return {
+        "snapshot_time_utc": now_utc_iso(),  # stamped again by ticks module; harmless duplicate
+        "symbols": rows,
+        "meta": {
+            "timeframes": TIMEFRAMES,
+            "note": "Indicators computed from CLOSED candles only (safe/non-repainting). Ticks added at export.",
+        },
+    }
+
+def pack_snapshot_chunked(rows: List[dict], max_per_file: int) -> List[dict]:
+    chunks = []
+    for i in range(0, len(rows), max_per_file):
+        chunk = rows[i:i + max_per_file]
+        chunks.append(pack_snapshot_from_rows(chunk))
+    return chunks
+
+# =========================
+# ---------- UI ----------
+# =========================
+
+st.set_page_config(page_title="Crypto Snapshot Builder", layout="wide")
+st.title("📈 Professional Snapshot Builder")
 
 with st.sidebar:
     st.header("Settings")
-
-    # Default preselection (safe subset)
-    default_selection = [
-        s for s in ["INJ/USDT","GRT/USDT","CRO/USDT","TRX/USDT","XRP/USDT","ETH/USDT","BTC/USDT","SOL/USDT",
-                   "ADA/USDT","FET/USDT","AVAX/USDT","LINK/USDT","PENGU/USDT","XTZ/USDT"]
-        if s in st.session_state.all_symbols
-    ] or ["BTC/USDT","ETH/USDT"]
-
-    # Symbols – uses the full universe
-    symbols = st.multiselect(
-        "Symbols (BASE/USDT)",
-        options=st.session_state.all_symbols,
-        default=default_selection,
-        help="Type to add more symbols like LINK/USDT, AVAX/USDT, FET/USDT…",
+    default_syms = DEFAULT_SYMBOLS
+    symbols_text = st.text_area(
+        "Symbols (one per line, e.g. BTC/USDT):",
+        value="\n".join(default_syms),
+        height=220
     )
+    split_output = st.checkbox("Split output into multiple files", value=False)
+    max_per_file = st.number_input("Max symbols per file (if split):", min_value=5, max_value=50, value=10, step=1)
+    run_btn = st.button("Build Snapshot")
 
-    # Quick add a custom symbol
-    custom = st.text_input("Add custom (e.g., FET/USDT)")
-    if custom:
-        cs = custom.upper().strip()
-        if cs.endswith("/USDT"):
-            if cs not in st.session_state.all_symbols:
-                st.session_state.all_symbols.append(cs)
-                st.session_state.all_symbols.sort()
-            if cs not in symbols:
-                symbols.append(cs)
+if not run_btn:
+    st.info("Configure symbols in the sidebar and click **Build Snapshot**.")
+    st.stop()
 
-    # Timeframes
-    tfs = st.multiselect(
-        "Timeframes",
-        options=st.session_state.timeframes,
-        default=["15m", "1h", "4h"],
+# Parse symbols
+symbols_input = [s.strip() for s in symbols_text.splitlines() if s.strip()]
+if not symbols_input:
+    st.error("Please enter at least one symbol.")
+    st.stop()
+
+# Build data
+st.write("Fetching data from Bitget…")
+ex = make_exchange()
+rows = build_rows(ex, symbols_input)
+st.success(f"Fetched {len(rows)} symbols.")
+
+# =========================
+# ---- Display summary ----
+# =========================
+
+table = []
+for row in rows:
+    sym = row.get("symbol", "?")
+    tf15 = row.get("tf", {}).get("15m", {})
+    ind = tf15.get("indicators", {})
+    struct = tf15.get("structure", {})
+    last_closed = tf15.get("last_closed", {})
+    table.append(
+        {
+            "symbol": sym,
+            "time": last_closed.get("t", ""),
+            "close": round(last_closed.get("c", float("nan")), 6),
+            "ema20": round(ind.get("ema20", float("nan")), 6),
+            "rsi14": round(ind.get("rsi14", float("nan")), 2),
+            "atr14": round(ind.get("atr14", float("nan")), 8),
+            "trend": struct.get("trend", "?"),
+            "dist_to_high": round(ind.get("dist_to_high", float("nan")), 4),
+            "dist_to_low": round(ind.get("dist_to_low", float("nan")), 4),
+            "vol_z": round(ind.get("vol_z", float("nan")), 2),
+        }
     )
+df = pd.DataFrame(table)
 
-    st.markdown("---")
-    candles_15m = st.number_input("15m candles", min_value=10, max_value=500, value=30, step=5)
-    candles_1h  = st.number_input("1h candles",  min_value=10, max_value=500, value=50, step=5)
-    candles_4h  = st.number_input("4h candles",  min_value=10, max_value=500, value=80, step=5)
-
-    tf_limits = {"15m": int(candles_15m), "1h": int(candles_1h), "4h": int(candles_4h)}
-
-    st.markdown("---")
-    split_output = st.checkbox("Split output into multiple JSON files", value=True)
-    max_per_file = st.number_input(
-        "Max symbols per file",
-        min_value=1, max_value=50, value=5, step=1,
-        help="How many symbols should be packed into each JSON file."
-    )
-
-st.write("")  # spacing
+# robust display
+try:
+    st.dataframe(df, use_container_width=True)
+except Exception:
+    st.table(df)
 
 # =========================
-# Scan helper
+# ----- Download JSON -----
 # =========================
-def run_scan(selected_symbols: list[str], selected_tfs: list[str], tf_limits: dict[str, int]):
-    """
-    Build per-(symbol, timeframe) blocks using utils.snapshot.build_tf_block.
-    Returns: list of dicts: {symbol, tf, block}
-    """
-    ex = make_exchange()
-    rows: list[dict] = []
 
-    for sym in selected_symbols:
-        sym_norm = normalize_symbol(sym, "USDT")
-        for tf in selected_tfs:
-            limit = int(tf_limits.get(tf, 50))
-            try:
-                # snapshot.build_tf_block supports 'limit=' kwarg
-                block = snap.build_tf_block(ex, sym_norm, tf, limit=limit)
-                rows.append({"symbol": sym_norm, "tf": tf, "block": block})
-            except Exception as e:
-                st.warning(f"{sym_norm} ({tf}) fetch error: {e}")
-    return rows
+ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
-def _chunk(lst: List[dict], n: int) -> List[List[dict]]:
-    """Yield chunks of size n from list."""
-    if n <= 0:
-        return [lst]
-    return [lst[i:i+n] for i in range(0, len(lst), n)]
+if split_output:
+    payloads = pack_snapshot_chunked(rows, int(max_per_file))
 
-def pack_snapshot_from_rows(rows: List[dict]) -> dict:
-    """
-    Group per-symbol and pack a single JSON snapshot (no chunking).
-    Also attaches sentiment (general + per symbol) for ONLY the bases present in `rows`.
-    """
-    by_symbol: dict[str, dict] = {}
-    bases = set()
+    # 🔵 Attach live ticks (precise live price at export time) to each chunk
+    payloads = augment_many_with_ticks(payloads)
 
-    for r in rows:
-        sym = r["symbol"]            # e.g., "INJ/USDT"
-        base = sym.split("/")[0]     # "INJ"
-        bases.add(base)
-
-        tf = r["tf"]
-        blk = r["block"]
-        if sym not in by_symbol:
-            by_symbol[sym] = {"symbol": sym, "timeframes": {}}
-        by_symbol[sym]["timeframes"][tf] = blk
-
-    # Build sentiment once per file (for the bases included)
-    sentiment = build_sentiment_bundle(sorted(bases))
-
-    packed = {
-        "generated_at_utc": now_utc_iso(),
-        "sentiment": sentiment,
-        "symbols": list(by_symbol.values()),
-        "meta": {
-            "source": "bitget",
-            "note": "LLM-friendly JSON snapshot",
-            "how_to_read": (
-                "Use 'sentiment.general' for broad market tone, "
-                "'sentiment.per_symbol[BASE]' for coin-level tone. "
-                "'symbols[].timeframes[tf]' holds candles + indicators."
-            ),
-        },
-    }
-    return packed
-
-def pack_snapshot_chunked(rows: List[dict], max_symbols_per_file: int) -> List[dict]:
-    """
-    Split the scan results into multiple JSON payloads, each with up to N symbols.
-    Sentiment is computed per-chunk so each output is standalone.
-    """
-    # First, group rows by symbol to avoid splitting the same symbol across files
-    symbols_map: Dict[str, List[dict]] = {}
-    for r in rows:
-        symbols_map.setdefault(r["symbol"], []).append(r)
-
-    # Rebuild a list of "symbol bundles"
-    symbol_bundles = []
-    for sym, rlist in symbols_map.items():
-        symbol_bundles.append(rlist)
-
-    # Chunk by symbol
-    chunks: List[List[dict]] = []
-    if max_symbols_per_file <= 0:
-        chunks = [rows]
-    else:
-        # Make contiguous groups where each group contains whole symbols
-        current: List[dict] = []
-        seen_syms: set = set()
-        for bundle in symbol_bundles:
-            sym = bundle[0]["symbol"]
-            if len(seen_syms) >= max_symbols_per_file:
-                chunks.append(current)
-                current = []
-                seen_syms = set()
-            current.extend(bundle)
-            seen_syms.add(sym)
-        if current:
-            chunks.append(current)
-
-    # Pack each chunk
-    return [pack_snapshot_from_rows(chunk_rows) for chunk_rows in chunks]
-
-# =========================
-# Run scan
-# =========================
-if st.button("🚀 Scan Now"):
-    if not symbols or not tfs:
-        st.error("Please select at least one symbol and one timeframe.")
-    else:
-        with st.spinner("Scanning…"):
-            st.session_state.scan_results = run_scan(symbols, tfs, tf_limits)
-
-# =========================
-# Results
-# =========================
-st.subheader("Results")
-
-rows = st.session_state.scan_results
-if not rows:
-    st.info("Click **Scan Now** to fetch data.")
-else:
-    # quick table summary
-    table = []
-    for r in rows:
-        ind = r["block"]["indicators"]
-        struct = r["block"]["structure"]
-        table.append(
-            {
-                "symbol": r["symbol"],
-                "tf": r["tf"],
-                "close": round(ind.get("close", float("nan")), 8),
-                "rsi14": round(ind.get("rsi14", float("nan")), 2),
-                "atr14": round(ind.get("atr14", float("nan")), 8),
-                "trend": struct.get("trend", "?"),
-                "dist_to_high": round(ind.get("dist_to_high", float("nan")), 4),
-                "dist_to_low": round(ind.get("dist_to_low", float("nan")), 4),
-                "vol_z": round(ind.get("vol_z", float("nan")), 2),
-            }
-        )
-    df = pd.DataFrame(table)
-
-    # robust display
-    try:
-        st.dataframe(df, use_container_width=True)
-    except Exception:
-        st.table(df)
-
-    # === Download(s) ===
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-    if split_output:
-        payloads = pack_snapshot_chunked(rows, int(max_per_file))
-        st.write(f"Creating **{len(payloads)}** JSON files (max {int(max_per_file)} symbols per file).")
-        for idx, packed in enumerate(payloads, start=1):
-            as_bytes = json.dumps(packed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            st.download_button(
-                f"⬇️ Download JSON #{idx}",
-                data=as_bytes,
-                file_name=f"snapshot_{ts}_{idx:02d}.json",
-                mime="application/json",
-                key=f"dl_{idx}",
-            )
-        with st.expander("🔍 Preview first JSON"):
-            st.code(json.dumps(payloads[0], indent=2, ensure_ascii=False), language="json")
-    else:
-        packed = pack_snapshot_from_rows(rows)
+    st.write(f"Creating **{len(payloads)}** JSON files (max {int(max_per_file)} symbols per file).")
+    for idx, packed in enumerate(payloads, start=1):
         as_bytes = json.dumps(packed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         st.download_button(
-            "⬇️ Download single JSON snapshot",
+            f"⬇️ Download JSON #{idx}",
             data=as_bytes,
-            file_name=f"snapshot_{ts}.json",
+            file_name=f"snapshot_{ts}_{idx:02d}.json",
             mime="application/json",
+            key=f"dl_{idx}",
         )
-        with st.expander("🔍 View JSON"):
-            st.code(json.dumps(packed, indent=2, ensure_ascii=False), language="json")
+    with st.expander("🔍 Preview first JSON"):
+        st.code(json.dumps(payloads[0], indent=2, ensure_ascii=False), language="json")
+else:
+    packed = pack_snapshot_from_rows(rows)
+
+    # 🔵 Attach live ticks (precise live price at export time) to single snapshot
+    packed = augment_with_ticks(packed)
+
+    as_bytes = json.dumps(packed, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    st.download_button(
+        "⬇️ Download single JSON snapshot",
+        data=as_bytes,
+        file_name=f"snapshot_{ts}.json",
+        mime="application/json",
+    )
+    with st.expander("🔍 View JSON"):
+        st.code(json.dumps(packed, indent=2, ensure_ascii=False), language="json")
