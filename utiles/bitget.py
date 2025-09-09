@@ -1,42 +1,69 @@
 # utiles/bitget.py
 from __future__ import annotations
-
-from typing import Final
-import ccxt
-import pandas as pd
+from typing import Dict, List
 from datetime import datetime, timezone
+import requests
+import pandas as pd
 
-# Map UI timeframes to CCXT timeframes
-TIMEFRAME_MAP: Final[dict[str, str]] = {
-    "15m": "15m",
-    "1h": "1h",
-    "4h": "4h",
+REQUEST_TIMEOUT = 12
+
+TIMEFRAME_MAP: Dict[str, str] = {
+    "1m": "1min",
+    "5m": "5min",
+    "15m": "15min",
+    "1h": "1hour",
+    "4h": "4hour",
+    "1d": "1day",
 }
 
 def now_utc_iso() -> str:
-    """UTC timestamp for snapshot stamping, ISO-8601 Zulu."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-def make_exchange() -> ccxt.bitget:
-    """Bitget spot client with sane defaults."""
-    ex = ccxt.bitget({
-        "enableRateLimit": True,
-        "options": {"defaultType": "spot"},
-    })
-    return ex
+def _get(url: str, params: Dict | None = None) -> dict:
+    r = requests.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
-def normalize_symbol(symbol: str, quote: str = "USDT") -> str:
-    """Accept 'FET/USDT' or 'FET' and normalize to 'FET/USDT'."""
-    return symbol.upper() if "/" in symbol else f"{symbol.upper()}/{quote}"
+def list_symbols_bitget(quote: str = "USDT") -> List[str]:
+    """Return spot symbols quoted in `quote`, e.g. ['BTC/USDT','ETH/USDT', ...]"""
+    url = "https://api.bitget.com/api/spot/v1/public/products"
+    data = _get(url)
+    items = data.get("data", []) if isinstance(data, dict) else []
+    out: List[str] = []
+    for it in items:
+        if it.get("quoteAsset") == quote and it.get("status") == "online":
+            base = it.get("baseAsset")
+            if base:
+                out.append(f"{base}/{quote}")
+    return sorted(list(dict.fromkeys(out)))
 
-# IMPORTANT: 'limit' is positional-only. Do NOT call with limit=...
-def fetch_ohlcv_df(ex: ccxt.bitget, symbol: str, tf: str, limit, /) -> pd.DataFrame:
-    """Fetch OHLCV into a clean, time-sorted DataFrame (UTC)."""
-    if tf not in TIMEFRAME_MAP:
-        raise ValueError(f"Unsupported timeframe: {tf}")
+def klines_bitget(symbol: str, timeframe: str, limit: int = 240) -> pd.DataFrame:
+    """Bitget OHLCV: columns [ts(ms), open, high, low, close, volume]"""
+    tf = TIMEFRAME_MAP.get(timeframe, "15min")
+    inst_id = symbol.replace("/", "")
+    url = "https://api.bitget.com/api/spot/v1/market/candles"
+    data = _get(url, {"symbol": inst_id, "period": tf, "limit": str(limit)})
+    cols = ["ts", "open", "high", "low", "close", "volume"]
+    rows = []
+    for r in data:
+        rows.append([int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])])
+    df = pd.DataFrame(rows, columns=cols)
+    if df.empty:
+        return df
+    df.sort_values("ts", inplace=True)
+    df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
+    return df.reset_index(drop=True)
 
-    ohlcv = ex.fetch_ohlcv(symbol, timeframe=TIMEFRAME_MAP[tf], limit=int(limit))
-    df = pd.DataFrame(ohlcv, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    df = df.sort_values("ts").reset_index(drop=True)
-    return df
+def ticker_bitget(symbol: str) -> dict:
+    """Return last/bid/ask for one symbol."""
+    inst_id = symbol.replace("/", "")
+    url = "https://api.bitget.com/api/spot/v1/market/ticker"
+    data = _get(url, {"symbol": inst_id})
+    d = data.get("data", {})
+    return {
+        "last": float(d.get("last", "nan")),
+        "bid": float(d.get("bestBid", "nan")),
+        "ask": float(d.get("bestAsk", "nan")),
+        "ts": int(d.get("ts", 0)),
+    }
+
