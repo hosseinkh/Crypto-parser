@@ -14,24 +14,24 @@ TIMEFRAME_MAP: Final[dict[str, str]] = {
 }
 
 def now_utc_iso() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(microsecond=0)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
+    """UTC timestamp for snapshot stamping, ISO-8601 Zulu."""
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 def make_exchange() -> ccxt.bitget:
-    ex = ccxt.bitget()
-    ex.load_markets()
+    """Bitget spot client with sane defaults."""
+    ex = ccxt.bitget({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
     return ex
 
 def normalize_symbol(symbol: str, quote: str = "USDT") -> str:
-    # Accept "FET/USDT" or "FET"
+    """Accept 'FET/USDT' or 'FET' and normalize to 'FET/USDT'."""
     return symbol.upper() if "/" in symbol else f"{symbol.upper()}/{quote}"
 
 # IMPORTANT: 'limit' is positional-only. Do NOT call with limit=...
 def fetch_ohlcv_df(ex: ccxt.bitget, symbol: str, tf: str, limit, /) -> pd.DataFrame:
+    """Fetch OHLCV into a clean, time-sorted DataFrame (UTC)."""
     if tf not in TIMEFRAME_MAP:
         raise ValueError(f"Unsupported timeframe: {tf}")
 
