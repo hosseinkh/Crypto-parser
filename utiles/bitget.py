@@ -1,10 +1,9 @@
 # utiles/bitget.py
 # -----------------------------------------------------------
-# Tiny wrapper around ccxt to create an exchange instance with:
-#  - rate-limit enabled
-#  - unified list of spot USDT symbols available as .symbols
-#  - safe market loading
-#  - optional API keys from env (not required for public data)
+# ccxt wrapper exposing:
+#  - .symbols (active SPOT /USDT)
+#  - fetch_ohlcv passthrough
+#  - make_exchange() constructor
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -15,32 +14,26 @@ import ccxt
 
 
 class _ExchangeWrapper:
-    """
-    Wraps a ccxt exchange to expose:
-      - .raw -> underlying ccxt instance
-      - .symbols -> list[str] of available SPOT symbols (e.g., "BTC/USDT")
-      - fetch_ohlcv passthrough
-    """
+    """Wraps a ccxt exchange, exposing .symbols and fetch_ohlcv()."""
+
     def __init__(self, ex: ccxt.Exchange):
         self.raw = ex
-        # Ensure markets are loaded
+        # Load markets safely
         try:
             self.raw.load_markets(reload=False)
         except Exception:
             self.raw.load_markets(reload=True)
 
-        # Build a clean SPOT /USDT symbol list
+        # Build clean SPOT/USDT symbol list
         syms: List[str] = []
         for m in self.raw.markets.values():
             if m.get("spot") and m.get("active") and m.get("quote") == "USDT":
-                # ccxt unifies id/symbol; use the human-readable symbol
                 sym = m.get("symbol")
                 if sym:
                     syms.append(sym)
-        # de-dup & sort
         self.symbols = sorted(set(syms))
 
-    # passthrough methods you already use
+    # passthrough used by the app
     def fetch_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 240):
         return self.raw.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
@@ -48,35 +41,29 @@ class _ExchangeWrapper:
 def make_exchange(name: str = "bitget") -> _ExchangeWrapper:
     """
     Create and return an exchange wrapped with the helpers above.
-    Supported names: "bitget", "binance", "bybit" (extend as needed).
-    Public endpoints only; if API keys are present in env, ccxt will use them.
+    Supported names: "bitget", "binance", "bybit".
+    Uses public endpoints; if API keys exist in env, ccxt will use them.
     """
     name = (name or "bitget").lower()
-
-    # Map a few common names to ccxt classes
     mapping = {
         "bitget": ccxt.bitget,
         "binance": ccxt.binance,
         "bybit": ccxt.bybit,
-        # Add more if you like
     }
     if name not in mapping:
         raise ValueError(f"Unsupported exchange '{name}'. Supported: {', '.join(mapping)}")
 
     cls = mapping[name]
 
-    # Optional keys from env (not necessary for public market data)
-    # BITGET_* or BINANCE_* etc; we pass whatever is present.
+    # Optional keys (not required)
     api_key = os.getenv("API_KEY") or os.getenv(f"{name.upper()}_API_KEY")
-    secret  = os.getenv("API_SECRET") or os.getenv(f"{name.upper()}_API_SECRET")
-    password = os.getenv("API_PASSWORD") or os.getenv(f"{name.upper()}_API_PASSWORD")  # for Bitget/OKX-like
+    secret = os.getenv("API_SECRET") or os.getenv(f"{name.upper()}_API_SECRET")
+    password = os.getenv("API_PASSWORD") or os.getenv(f"{name.upper()}_API_PASSWORD")
 
     kwargs = {
         "enableRateLimit": True,
         "timeout": 20000,
-        "options": {
-            "defaultType": "spot",  # ensure spot markets
-        }
+        "options": {"defaultType": "spot"},
     }
     if api_key and secret:
         kwargs.update({"apiKey": api_key, "secret": secret})
@@ -87,7 +74,7 @@ def make_exchange(name: str = "bitget") -> _ExchangeWrapper:
     return _ExchangeWrapper(ex)
 
 
-# For backward compatibility if some code imports get_exchange
+# Backward-compat alias
 def get_exchange(name: str = "bitget") -> _ExchangeWrapper:
     return make_exchange(name)
 
