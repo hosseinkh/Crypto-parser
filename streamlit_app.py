@@ -20,30 +20,22 @@ default_list = st.sidebar.text_area(
 )
 base_list = [s.strip().upper() for s in default_list.split(",") if s.strip()]
 
-# Always-include items
 ALWAYS_INCLUDE = ["GALA/USDT", "XLM/USDT"]
 
-# Initialize working_symbols once per session
 if "working_symbols" not in st.session_state:
     st.session_state["working_symbols"] = sorted(set(base_list + ALWAYS_INCLUDE))
 
-# Small helper to pretty-print current working list
 def show_working_list():
     wl = st.session_state["working_symbols"]
-    if wl:
-        st.write(", ".join(wl))
-    else:
-        st.info("Working list is empty. Add some symbols or run the trending scan.")
+    st.write(", ".join(wl) if wl else "—")
 
 # -------------------------- Manual add/remove ----------------------------------
 st.title("📌 Current working list")
 col_a, col_b = st.columns([3, 2])
-
 with col_a:
     show_working_list()
 
 with col_b:
-    # Build TF choices from exchange capabilities, fallback to full set
     ex = make_exchange(exchange_name)
     all_syms = sorted([s for s in getattr(ex, "symbols", []) if s.endswith("/USDT")]) or []
     manual = st.selectbox("➕ Add symbol (/USDT)", [""] + all_syms, index=0, key="add_sym_box")
@@ -54,8 +46,6 @@ with col_b:
             st.success(f"Added {manual}")
         else:
             st.info(f"{manual} already in list.")
-
-    # Optional: quick remove
     if st.session_state["working_symbols"]:
         rem = st.selectbox("➖ Remove symbol", [""] + st.session_state["working_symbols"], index=0, key="rem_sym_box")
         if rem:
@@ -67,16 +57,24 @@ st.markdown("---")
 # -------------------------- Trending scan -------------------------------------
 st.header("🔍 Scan market and add Top-N with reasons")
 
-col1, col2, col3 = st.columns([1, 1, 1])
+col1, col2, col3, col4 = st.columns([1, 1, 1, 1])
 with col1:
     top_n = st.number_input("Top-N trendy", value=10, min_value=1, max_value=50, step=1)
 with col2:
     min_vz = st.slider("Min vol_z", 0.0, 3.0, 0.8, 0.05)
 with col3:
     tf_scan = st.selectbox("Scan timeframe", ["15m", "1h", "4h"], index=0)
+with col4:
+    include_sent_scan = st.checkbox("Include sentiment (scan)", value=True)
 
 if st.button("Scan market and add Top-N with reasons"):
-    tparams = TrendScanParams(exchange_name=exchange_name, top_n=top_n, min_vol_z=min_vz, timeframe=tf_scan)
+    tparams = TrendScanParams(
+        exchange_name=exchange_name,
+        top_n=top_n,
+        min_vol_z=min_vz,
+        timeframe=tf_scan,
+        include_sentiment=include_sent_scan
+    )
     rows = scan_trending(tparams)
     if not rows:
         st.warning("No trendy symbols found (try lowering Min vol_z).")
@@ -89,7 +87,6 @@ if st.button("Scan market and add Top-N with reasons"):
             if sym not in st.session_state["working_symbols"]:
                 st.session_state["working_symbols"].append(sym)
                 newly_added.append(sym)
-
         if newly_added:
             st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
             st.info("Added to working list: " + ", ".join(newly_added))
@@ -101,7 +98,6 @@ st.markdown("---")
 # -------------------------- Build Snapshot (v4.1) -----------------------------
 st.header("📸 Build snapshot (v4.1)")
 
-# Timeframes multiselect (with safe fallback)
 cap_tfs = []
 try:
     if getattr(ex, "timeframes", None):
@@ -121,8 +117,8 @@ timeframes = st.multiselect(
 st.caption(f"Available TFs: {', '.join(ALL_TFS)} | Selected: {', '.join(timeframes or DEFAULT_TFS)}")
 
 candles_limit = st.number_input("Candles per TF", value=240, min_value=100, max_value=2000, step=10)
+include_sent_snapshot = st.checkbox("Include sentiment (snapshot)", value=True)
 
-# Build for EXACT working list (including trendy additions)
 if st.button("Build snapshot now", key="build_snapshot_btn"):
     working_universe = st.session_state["working_symbols"]
     if not working_universe:
@@ -132,7 +128,8 @@ if st.button("Build snapshot now", key="build_snapshot_btn"):
             timeframes=timeframes or DEFAULT_TFS,
             candles_limit=candles_limit,
             exchange_name=exchange_name,
-            universe=working_universe,  # ✅ analyze exactly what’s in the working list
+            universe=working_universe,
+            include_sentiment=include_sent_snapshot,   # ✅
             meta={"ui_timeframes": timeframes or DEFAULT_TFS, "ui_symbols": working_universe},
         )
         snapshot = build_snapshot_v41(sparams)
@@ -154,14 +151,3 @@ if st.button("Build snapshot now", key="build_snapshot_btn"):
             file_name=f"snapshot_{snapshot['version']}.json",
             mime="application/json",
         )
-
-st.markdown("---")
-
-# -------------------------- Quick help ----------------------------------------
-with st.expander("Why isn’t a symbol analyzed?"):
-    st.write(
-        "- The snapshot analyzes **only** the `working list`.\n"
-        "- Use **Scan market** to add trendy symbols (BAL/SYRUP/BSW, etc.).\n"
-        "- Or **Add symbol** manually from the dropdown.\n"
-        "- Then click **Build snapshot**."
-    )
