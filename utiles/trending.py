@@ -1,6 +1,7 @@
 # utiles/trending.py
 # -----------------------------------------------------------
 # Trend scanner + human-readable reasons for additions.
+# Works with ccxt exchanges and your indicators engine.
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -20,6 +21,10 @@ except Exception:  # local dev fallback
 
 # --- Sentiment hook (safe if not configured) ----------------
 def _get_sentiment_score(symbol: str) -> float:
+    """
+    Try to pull a score from utiles.sentiment.get_sentiment_for_symbol(symbol).
+    If unavailable or errors, return 0.0
+    """
     try:
         from utiles.sentiment import get_sentiment_for_symbol
         score, _label = get_sentiment_for_symbol(symbol)
@@ -80,8 +85,8 @@ def _compute_24h_vol_z(df: pd.DataFrame, bars_24h: int, window: int = 20) -> flo
 def explain_trending_row(row: pd.Series, p: TrendScanParams) -> List[str]:
     """
     Build reasons for why a row (symbol) is considered 'trending'.
-    Expects columns: pct4h, vol_z24h, rsi14_15m, sentiment_score,
-                     dist_to_low_pct, dist_to_high_pct.
+    Requires columns: pct4h, vol_z24h, rsi14_15m, sentiment_score,
+                      dist_to_low_pct, dist_to_high_pct.
     """
     reasons: List[str] = []
     if pd.notna(row.get("pct4h")) and row["pct4h"] >= p.min_pct_4h:
