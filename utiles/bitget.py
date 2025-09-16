@@ -1,69 +1,95 @@
 # utiles/bitget.py
+# -----------------------------------------------------------
+# Tiny wrapper around ccxt to create an exchange instance with:
+#  - rate-limit enabled
+#  - unified list of spot USDT symbols available as .symbols
+#  - safe market loading
+#  - optional API keys from env (not required for public data)
+# -----------------------------------------------------------
+
 from __future__ import annotations
-from typing import Dict, List
-from datetime import datetime, timezone
-import requests
-import pandas as pd
 
-REQUEST_TIMEOUT = 12
+import os
+from typing import List
+import ccxt
 
-TIMEFRAME_MAP: Dict[str, str] = {
-    "1m": "1min",
-    "5m": "5min",
-    "15m": "15min",
-    "1h": "1hour",
-    "4h": "4hour",
-    "1d": "1day",
-}
 
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+class _ExchangeWrapper:
+    """
+    Wraps a ccxt exchange to expose:
+      - .raw -> underlying ccxt instance
+      - .symbols -> list[str] of available SPOT symbols (e.g., "BTC/USDT")
+      - fetch_ohlcv passthrough
+    """
+    def __init__(self, ex: ccxt.Exchange):
+        self.raw = ex
+        # Ensure markets are loaded
+        try:
+            self.raw.load_markets(reload=False)
+        except Exception:
+            self.raw.load_markets(reload=True)
 
-def _get(url: str, params: Dict | None = None) -> dict:
-    r = requests.get(url, params=params or {}, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
+        # Build a clean SPOT /USDT symbol list
+        syms: List[str] = []
+        for m in self.raw.markets.values():
+            if m.get("spot") and m.get("active") and m.get("quote") == "USDT":
+                # ccxt unifies id/symbol; use the human-readable symbol
+                sym = m.get("symbol")
+                if sym:
+                    syms.append(sym)
+        # de-dup & sort
+        self.symbols = sorted(set(syms))
 
-def list_symbols_bitget(quote: str = "USDT") -> List[str]:
-    """Return spot symbols quoted in `quote`, e.g. ['BTC/USDT','ETH/USDT', ...]"""
-    url = "https://api.bitget.com/api/spot/v1/public/products"
-    data = _get(url)
-    items = data.get("data", []) if isinstance(data, dict) else []
-    out: List[str] = []
-    for it in items:
-        if it.get("quoteAsset") == quote and it.get("status") == "online":
-            base = it.get("baseAsset")
-            if base:
-                out.append(f"{base}/{quote}")
-    return sorted(list(dict.fromkeys(out)))
+    # passthrough methods you already use
+    def fetch_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 240):
+        return self.raw.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
-def klines_bitget(symbol: str, timeframe: str, limit: int = 240) -> pd.DataFrame:
-    """Bitget OHLCV: columns [ts(ms), open, high, low, close, volume]"""
-    tf = TIMEFRAME_MAP.get(timeframe, "15min")
-    inst_id = symbol.replace("/", "")
-    url = "https://api.bitget.com/api/spot/v1/market/candles"
-    data = _get(url, {"symbol": inst_id, "period": tf, "limit": str(limit)})
-    cols = ["ts", "open", "high", "low", "close", "volume"]
-    rows = []
-    for r in data:
-        rows.append([int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])])
-    df = pd.DataFrame(rows, columns=cols)
-    if df.empty:
-        return df
-    df.sort_values("ts", inplace=True)
-    df["time"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
-    return df.reset_index(drop=True)
 
-def ticker_bitget(symbol: str) -> dict:
-    """Return last/bid/ask for one symbol."""
-    inst_id = symbol.replace("/", "")
-    url = "https://api.bitget.com/api/spot/v1/market/ticker"
-    data = _get(url, {"symbol": inst_id})
-    d = data.get("data", {})
-    return {
-        "last": float(d.get("last", "nan")),
-        "bid": float(d.get("bestBid", "nan")),
-        "ask": float(d.get("bestAsk", "nan")),
-        "ts": int(d.get("ts", 0)),
+def make_exchange(name: str = "bitget") -> _ExchangeWrapper:
+    """
+    Create and return an exchange wrapped with the helpers above.
+    Supported names: "bitget", "binance", "bybit" (extend as needed).
+    Public endpoints only; if API keys are present in env, ccxt will use them.
+    """
+    name = (name or "bitget").lower()
+
+    # Map a few common names to ccxt classes
+    mapping = {
+        "bitget": ccxt.bitget,
+        "binance": ccxt.binance,
+        "bybit": ccxt.bybit,
+        # Add more if you like
     }
+    if name not in mapping:
+        raise ValueError(f"Unsupported exchange '{name}'. Supported: {', '.join(mapping)}")
 
+    cls = mapping[name]
+
+    # Optional keys from env (not necessary for public market data)
+    # BITGET_* or BINANCE_* etc; we pass whatever is present.
+    api_key = os.getenv("API_KEY") or os.getenv(f"{name.upper()}_API_KEY")
+    secret  = os.getenv("API_SECRET") or os.getenv(f"{name.upper()}_API_SECRET")
+    password = os.getenv("API_PASSWORD") or os.getenv(f"{name.upper()}_API_PASSWORD")  # for Bitget/OKX-like
+
+    kwargs = {
+        "enableRateLimit": True,
+        "timeout": 20000,
+        "options": {
+            "defaultType": "spot",  # ensure spot markets
+        }
+    }
+    if api_key and secret:
+        kwargs.update({"apiKey": api_key, "secret": secret})
+    if password:
+        kwargs.update({"password": password})
+
+    ex = cls(kwargs)
+    return _ExchangeWrapper(ex)
+
+
+# For backward compatibility if some code imports get_exchange
+def get_exchange(name: str = "bitget") -> _ExchangeWrapper:
+    return make_exchange(name)
+
+
+__all__ = ["make_exchange", "get_exchange", "_ExchangeWrapper"]
