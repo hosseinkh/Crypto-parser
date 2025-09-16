@@ -1,11 +1,13 @@
 # streamlit_app.py
 # -----------------------------------------------------------
 # Watchlist with always-included favorites (incl. GALA/XLM),
-# Trending scan with reasons, and a "Build snapshot" button.
+# Trending scan with reasons (shows count + table of NEW adds),
+# and "Build snapshot" with download buttons (JSON + CSV).
 # -----------------------------------------------------------
 
 from __future__ import annotations
-import os, sys, importlib
+import os, sys, importlib, json, io
+from datetime import datetime, timezone
 from typing import List
 import streamlit as st
 import pandas as pd
@@ -147,34 +149,50 @@ params = TrendScanParams()
 if st.button("Scan market and add with reasons"):
     try:
         df = scan_trending(ex, params=params)
+
         if df.empty:
             st.info("No trending candidates met the thresholds.")
         else:
-            st.dataframe(df[[
-                "symbol","score","pct4h","vol_z24h","sentiment_score",
-                "rsi14_15m","dist_to_low_pct","dist_to_high_pct"
-            ]].head(30))
+            # Determine which ones are NEW (not already on the list)
+            current_set = set(st.session_state["working_symbols"])
+            df_new = df[~df["symbol"].isin(current_set)].copy()
 
+            # Build a 'reasons' column for the NEW ones
+            df_new["reasons"] = df_new.apply(lambda r: "; ".join(explain_trending_row(r, params)), axis=1)
+
+            # Show count + table of NEW additions
+            to_add_count = len(df_new)
+            st.markdown(f"**Will add:** `{to_add_count}` symbols")
+            if to_add_count:
+                st.dataframe(
+                    df_new[["symbol", "score", "pct4h", "vol_z24h", "sentiment_score", "rsi14_15m", "reasons"]]
+                    .reset_index(drop=True)
+                )
+
+            # Show also the full ranked list (for context)
+            with st.expander("See full ranked scan (all candidates)"):
+                st.dataframe(
+                    df[["symbol","score","pct4h","vol_z24h","sentiment_score","rsi14_15m","dist_to_low_pct","dist_to_high_pct"]]
+                    .reset_index(drop=True)
+                )
+
+            # Add NEW ones to watchlist
             added = []
-            for _, row in df.iterrows():
+            for _, row in df_new.iterrows():
                 sym = row["symbol"]
-                if sym not in st.session_state["working_symbols"]:
-                    st.session_state["working_symbols"].append(sym)
-                    reasons = explain_trending_row(row, params)
-                    added.append((sym, reasons))
+                st.session_state["working_symbols"].append(sym)
+                added.append(sym)
 
             st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
-            if added:
-                st.success("New symbols added:")
-                for sym, reasons in added:
-                    st.write(f"• **{sym}** — " + "; ".join(reasons))
-            else:
-                st.info("No new symbols were added (already present or no reasons).")
+            st.success(f"Added {len(added)} new symbol(s): " + (", ".join(added) if added else "—"))
     except Exception as e:
         st.error(f"Scan failed: {e}")
 
 st.markdown("---")
 st.subheader("📷 Build snapshot")
+
+def _utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 try:
     snap_mod = importlib.import_module("utiles.snapshot")
@@ -187,5 +205,30 @@ if snap_mod and st.button("Build snapshot now"):
         snap = snap_mod.build_snapshot(ex, st.session_state["working_symbols"], timeframe="15m", limit=240)
         st.success("Snapshot built successfully!")
         st.json(snap)
+
+        # --- Download buttons ---
+        ts = _utc_iso()
+
+        # JSON
+        json_bytes = json.dumps(snap, ensure_ascii=False, indent=2).encode("utf-8")
+        st.download_button(
+            label="⬇️ Download snapshot (JSON)",
+            data=json_bytes,
+            file_name=f"snapshot_{ts}.json",
+            mime="application/json",
+        )
+
+        # CSV (flatten items)
+        items = snap.get("items", [])
+        if items:
+            df_items = pd.DataFrame(items)
+            csv_buf = io.StringIO()
+            df_items.to_csv(csv_buf, index=False)
+            st.download_button(
+                label="⬇️ Download snapshot items (CSV)",
+                data=csv_buf.getvalue().encode("utf-8"),
+                file_name=f"snapshot_items_{ts}.csv",
+                mime="text/csv",
+            )
     except Exception as e:
         st.error(f"Snapshot build failed: {e}")
