@@ -1,70 +1,62 @@
 # utiles/bitget.py
 # -----------------------------------------------------------
 # ccxt wrapper exposing:
-#  - .symbols (active SPOT /USDT)
-#  - fetch_ohlcv passthrough
-#  - make_exchange() constructor
+#   • make_exchange()  → returns wrapper with .symbols and fetch_ohlcv()
+#   • get_exchange()   → alias for backward compatibility
+#   • ticker_bitget()  → lightweight one-off public ticker (used by ticks.py)
+#   • now_utc_iso()    → small helper (used elsewhere)
 # -----------------------------------------------------------
 
 from __future__ import annotations
 
 import os
-from typing import List
+from datetime import datetime, timezone
+from typing import List, Dict, Any
 import ccxt
 
 
-class _ExchangeWrapper:
-    """Wraps a ccxt exchange, exposing .symbols and fetch_ohlcv()."""
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
+
+class _ExchangeWrapper:
+    """Wrap a ccxt exchange; expose .symbols (active SPOT/USDT) and fetch_ohlcv()."""
     def __init__(self, ex: ccxt.Exchange):
         self.raw = ex
-        # Load markets safely
         try:
             self.raw.load_markets(reload=False)
         except Exception:
             self.raw.load_markets(reload=True)
 
-        # Build clean SPOT/USDT symbol list
         syms: List[str] = []
         for m in self.raw.markets.values():
+            # SPOT, active, quoted in USDT → “BTC/USDT”, etc.
             if m.get("spot") and m.get("active") and m.get("quote") == "USDT":
-                sym = m.get("symbol")
-                if sym:
-                    syms.append(sym)
+                s = m.get("symbol")
+                if s:
+                    syms.append(s)
         self.symbols = sorted(set(syms))
 
-    # passthrough used by the app
     def fetch_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 240):
         return self.raw.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 
 def make_exchange(name: str = "bitget") -> _ExchangeWrapper:
     """
-    Create and return an exchange wrapped with the helpers above.
-    Supported names: "bitget", "binance", "bybit".
-    Uses public endpoints; if API keys exist in env, ccxt will use them.
+    Build an exchange and wrap it. Supports: bitget, binance, bybit.
+    Uses public endpoints (API keys optional via env).
     """
     name = (name or "bitget").lower()
-    mapping = {
-        "bitget": ccxt.bitget,
-        "binance": ccxt.binance,
-        "bybit": ccxt.bybit,
-    }
+    mapping = {"bitget": ccxt.bitget, "binance": ccxt.binance, "bybit": ccxt.bybit}
     if name not in mapping:
         raise ValueError(f"Unsupported exchange '{name}'. Supported: {', '.join(mapping)}")
-
     cls = mapping[name]
 
-    # Optional keys (not required)
     api_key = os.getenv("API_KEY") or os.getenv(f"{name.upper()}_API_KEY")
-    secret = os.getenv("API_SECRET") or os.getenv(f"{name.upper()}_API_SECRET")
+    secret  = os.getenv("API_SECRET") or os.getenv(f"{name.upper()}_API_SECRET")
     password = os.getenv("API_PASSWORD") or os.getenv(f"{name.upper()}_API_PASSWORD")
 
-    kwargs = {
-        "enableRateLimit": True,
-        "timeout": 20000,
-        "options": {"defaultType": "spot"},
-    }
+    kwargs = {"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": "spot"}}
     if api_key and secret:
         kwargs.update({"apiKey": api_key, "secret": secret})
     if password:
@@ -74,9 +66,26 @@ def make_exchange(name: str = "bitget") -> _ExchangeWrapper:
     return _ExchangeWrapper(ex)
 
 
-# Backward-compat alias
 def get_exchange(name: str = "bitget") -> _ExchangeWrapper:
+    """Backward-compat alias."""
     return make_exchange(name)
 
 
-__all__ = ["make_exchange", "get_exchange", "_ExchangeWrapper"]
+def ticker_bitget(symbol: str) -> Dict[str, Any]:
+    """
+    Lightweight public ticker. Returns {'last','bid','ask','ts'} or {'error':...}.
+    """
+    ex = ccxt.bitget({"enableRateLimit": True, "timeout": 20000})
+    try:
+        t = ex.fetch_ticker(symbol)
+    except Exception as e:
+        return {"error": str(e)}
+    return {
+        "last": t.get("last") or t.get("close"),
+        "bid": t.get("bid"),
+        "ask": t.get("ask"),
+        "ts": t.get("timestamp") or t.get("datetime"),
+    }
+
+
+__all__ = ["make_exchange", "get_exchange", "ticker_bitget", "now_utc_iso", "_ExchangeWrapper"]
