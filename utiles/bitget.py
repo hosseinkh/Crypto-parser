@@ -1,88 +1,67 @@
 # utiles/bitget.py
-# -----------------------------------------------------------
-# ccxt wrapper exposing:
-#   • make_exchange()  → returns wrapper with .symbols + fetch_ohlcv()
-#   • get_exchange()   → alias
-#   • ticker_bitget()  → lightweight public ticker (used by ticks.py)
-#   • now_utc_iso()    → small helper
-# -----------------------------------------------------------
-
 from __future__ import annotations
+import time
+from typing import Dict, List, Any, Optional, Tuple
 
-import os
-from datetime import datetime, timezone
-from typing import List, Dict, Any
-import ccxt
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+try:
+    import ccxt
+except Exception as e:
+    raise RuntimeError("ccxt is required. pip install ccxt") from e
 
 
-class _ExchangeWrapper:
-    """Wrap a ccxt exchange; expose .symbols (active SPOT/USDT) and fetch_ohlcv()."""
-    def __init__(self, ex: ccxt.Exchange):
-        self.raw = ex
+# ---- PUBLIC API (used by other modules) --------------------------------------
+
+def make_exchange(ex_name: Optional[str] = None, rate_limit: bool = True):
+    """
+    Create and return a ccxt exchange instance (Bitget by default)
+    with sane defaults for public data access.
+    """
+    name = (ex_name or "bitget").lower()
+    if not hasattr(ccxt, name):
+        raise ValueError(f"Unsupported exchange: {name}")
+
+    exchange = getattr(ccxt, name)({
+        "enableRateLimit": True,
+        "options": {"defaultType": "spot"},
+    })
+    exchange.load_markets()
+    return exchange
+
+
+def fetch_ohlcv_safe(ex, symbol: str, timeframe: str, limit: int) -> List[List[Any]]:
+    """
+    Robust OHLCV fetch with small retry to survive transient errors/rate limits.
+    """
+    if limit <= 0:
+        limit = 200
+    for attempt in range(3):
         try:
-            self.raw.load_markets(reload=False)
+            return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)  # [ts, o,h,l,c,v]
         except Exception:
-            self.raw.load_markets(reload=True)
-
-        syms: List[str] = []
-        for m in self.raw.markets.values():
-            if m.get("spot") and m.get("active") and m.get("quote") == "USDT":
-                s = m.get("symbol")
-                if s:
-                    syms.append(s)
-        self.symbols = sorted(set(syms))
-
-    def fetch_ohlcv(self, symbol: str, timeframe: str = "15m", limit: int = 240):
-        return self.raw.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+            time.sleep(0.5 + attempt * 0.7)
+    # last try (if it raises, let it bubble up so we can see the real error)
+    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
 
 
-def make_exchange(name: str = "bitget") -> _ExchangeWrapper:
+def fetch_ticker_safe(ex, symbol: str) -> Dict[str, Any]:
+    for attempt in range(3):
+        try:
+            return ex.fetch_ticker(symbol)
+        except Exception:
+            time.sleep(0.5 + attempt * 0.7)
+    return ex.fetch_ticker(symbol)
+
+
+def list_spot_usdt_symbols(ex) -> List[str]:
     """
-    Build an exchange and wrap it. Supports: bitget, binance, bybit.
-    Uses public endpoints (API keys optional via env).
+    Return a clean list of spot symbols ending with /USDT and tradable.
     """
-    name = (name or "bitget").lower()
-    mapping = {"bitget": ccxt.bitget, "binance": ccxt.binance, "bybit": ccxt.bybit}
-    if name not in mapping:
-        raise ValueError(f"Unsupported exchange '{name}'. Supported: {', '.join(mapping)}")
-    cls = mapping[name]
-
-    api_key = os.getenv("API_KEY") or os.getenv(f"{name.upper()}_API_KEY")
-    secret  = os.getenv("API_SECRET") or os.getenv(f"{name.upper()}_API_SECRET")
-    password = os.getenv("API_PASSWORD") or os.getenv(f"{name.upper()}_API_PASSWORD")
-
-    kwargs = {"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": "spot"}}
-    if api_key and secret:
-        kwargs.update({"apiKey": api_key, "secret": secret})
-    if password:
-        kwargs.update({"password": password})
-
-    ex = cls(kwargs)
-    return _ExchangeWrapper(ex)
-
-
-def get_exchange(name: str = "bitget") -> _ExchangeWrapper:
-    """Backward-compat alias."""
-    return make_exchange(name)
-
-
-def ticker_bitget(symbol: str) -> Dict[str, Any]:
-    """Lightweight public ticker. Returns {'last','bid','ask','ts'} or {'error':...}."""
-    ex = ccxt.bitget({"enableRateLimit": True, "timeout": 20000})
-    try:
-        t = ex.fetch_ticker(symbol)
-    except Exception as e:
-        return {"error": str(e)}
-    return {
-        "last": t.get("last") or t.get("close"),
-        "bid": t.get("bid"),
-        "ask": t.get("ask"),
-        "ts": t.get("timestamp") or t.get("datetime"),
-    }
-
-
-__all__ = ["make_exchange", "get_exchange", "ticker_bitget", "now_utc_iso", "_ExchangeWrapper"]
+    out = []
+    for s, m in ex.markets.items():
+        try:
+            if m.get("spot") and s.endswith("/USDT") and not m.get("inactive", False):
+                out.append(s)
+        except Exception:
+            continue
+    out.sort()
+    return out
