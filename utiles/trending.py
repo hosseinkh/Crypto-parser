@@ -79,10 +79,6 @@ def _compute_24h_vol_z(df: pd.DataFrame, bars_24h: int, window: int = 20) -> flo
 
 # ---------- Reasons ----------
 def explain_trending_row(row: pd.Series, p: TrendScanParams) -> List[str]:
-    """
-    Reasons why a symbol is 'trending'.
-    Needs: pct4h, vol_z24h, rsi14_15m, sentiment_score, dist_to_low_pct, dist_to_high_pct.
-    """
     reasons: List[str] = []
     if pd.notna(row.get("pct4h")) and row["pct4h"] >= p.min_pct_4h:
         reasons.append(f"4h momentum +{row['pct4h']:.2f}%")
@@ -155,11 +151,16 @@ def scan_trending(
 
     if not rows:
         return pd.DataFrame(columns=[
-            "symbol","last","pct4h","vol_z24h","rsi14_15m","sentiment_score",
-            "dist_to_low_pct","dist_to_high_pct","score"
+            "symbol","last","pct4h","vol_z24h","rsi14_15m",
+            "sentiment_score","dist_to_low_pct","dist_to_high_pct","score"
         ])
 
     df = pd.DataFrame(rows)
+
+    # Ensure columns exist (defensive)
+    for col in ["pct4h","vol_z24h","rsi14_15m","sentiment_score","dist_to_low_pct","dist_to_high_pct"]:
+        if col not in df:
+            df[col] = float("nan")
 
     # Score
     def _z(col: pd.Series) -> pd.Series:
