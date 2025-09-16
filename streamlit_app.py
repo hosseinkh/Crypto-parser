@@ -1,42 +1,35 @@
 # streamlit_app.py
 # -----------------------------------------------------------
-# Minimal, robust Streamlit app that:
-# - Ensures utiles/ is a package
-# - Loads trending module silently (no ImportError noise)
-# - Always includes Favorites + GALA + XLM
-# - Adds trending coins and shows human-readable reasons
+# Streamlit UI: favorites always present (incl. GALA, XLM),
+# trending scanner adds coins and explains why.
 # -----------------------------------------------------------
 
 from __future__ import annotations
 
 import os, sys, importlib
-from typing import List, Set
+from typing import List
 import streamlit as st
 import pandas as pd
+from dataclasses import dataclass
 
-# --- Make sure 'utiles' is importable -----------------------------------------
+# ---------- Robust import of your utils ----------
 ROOT_DIR = os.path.dirname(__file__)
-UTIL_DIR = os.path.join(ROOT_DIR, "utiles")
+UTIL_DIR  = os.path.join(ROOT_DIR, "utiles")
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 os.makedirs(UTIL_DIR, exist_ok=True)
 init_path = os.path.join(UTIL_DIR, "__init__.py")
 if not os.path.exists(init_path):
-    open(init_path, "a").close()  # create empty __init__.py
+    open(init_path, "a").close()  # ensure 'utiles' is a package
 
-# --- Exchange via ccxt (fallback if your own wrapper isn't present) -----------
+# Exchange helper (uses your existing module)
 try:
-    from utiles.bitget import make_exchange  # your helper if it exists
-except Exception:
-    import ccxt  # type: ignore
+    from utiles.bitget import make_exchange  # your project helper
+except Exception as e:
+    st.error(f"Failed to import utiles.bitget.make_exchange: {e}")
+    st.stop()
 
-    def make_exchange(ex_name: str = "bitget"):
-        ex = getattr(ccxt, ex_name)()
-        ex.enableRateLimit = True
-        ex.load_markets()
-        return ex
-
-# --- Import trending module silently ------------------------------------------
+# Trending scanner module (import module, then pull symbols)
 try:
     trending_mod = importlib.import_module("utiles.trending")
 except Exception as e:
@@ -47,19 +40,47 @@ scan_trending = getattr(trending_mod, "scan_trending", None)
 explain_trending_row = getattr(trending_mod, "explain_trending_row", None)
 TrendScanParams = getattr(trending_mod, "TrendScanParams", None)
 
-_missing = [n for n,v in {
-    "scan_trending": scan_trending,
-    "explain_trending_row": explain_trending_row,
-    "TrendScanParams": TrendScanParams
-}.items() if v is None]
-if _missing:
-    st.error("utiles.trending is missing: " + ", ".join(_missing))
+# Fallbacks if module is missing some names (keeps app running)
+if TrendScanParams is None:
+    @dataclass
+    class TrendScanParams:
+        min_pct_4h: float = 0.5
+        min_volz_24h: float = 0.8
+        rsi15m_min: float = 35.0
+        rsi15m_max: float = 65.0
+        min_sentiment: float = 0.05
+        near_support_max_pct: float = 2.5
+        near_resist_max_pct: float = 1.5
+
+if explain_trending_row is None:
+    def explain_trending_row(row: pd.Series, p: TrendScanParams) -> List[str]:
+        reasons: List[str] = []
+        if pd.notna(row.get("pct4h")) and row["pct4h"] >= p.min_pct_4h:
+            reasons.append(f"4h momentum +{row['pct4h']:.2f}%")
+        if pd.notna(row.get("vol_z24h")) and row["vol_z24h"] >= p.min_volz_24h:
+            reasons.append(f"24h volume spike (z={row['vol_z24h']:.2f})")
+        rsi = row.get("rsi14_15m")
+        if pd.notna(rsi) and p.rsi15m_min <= rsi <= p.rsi15m_max:
+            reasons.append(f"15m RSI in range ({rsi:.1f})")
+        sent = row.get("sentiment_score")
+        if pd.notna(sent) and sent >= p.min_sentiment:
+            reasons.append(f"positive sentiment ({sent:+.2f})")
+        dlow = row.get("dist_to_low_pct")
+        if pd.notna(dlow) and dlow <= p.near_support_max_pct:
+            reasons.append(f"near support ({dlow:.2f}% from low)")
+        dhigh = row.get("dist_to_high_pct")
+        if pd.notna(dhigh) and dhigh <= p.near_resist_max_pct:
+            reasons.append(f"near resistance ({dhigh:.2f}% from high)")
+        return reasons
+
+if scan_trending is None:
+    st.error("utiles.trending is missing: scan_trending")
     st.stop()
 
-# --- Defaults / Favorites ------------------------------------------------------
-ALWAYS_INCLUDE: Set[str] = {"GALA/USDT", "XLM/USDT"}
+# ---------- Favorites / watchlist bootstrapping ----------
+ALWAYS_INCLUDE = {"GALA/USDT", "XLM/USDT"}
 
-DEFAULT_FAVORITES: Set[str] = {
+DEFAULT_FAVORITES = {
     "BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT", "XRP/USDT",
     "LINK/USDT", "AVAX/USDT", "TRX/USDT", "DOT/USDT", "LTC/USDT",
     "INJ/USDT", "GRT/USDT", "CRO/USDT", "XTZ/USDT", "FET/USDT"
@@ -67,68 +88,60 @@ DEFAULT_FAVORITES: Set[str] = {
 
 def _init_watchlist(exchange):
     available = {s for s in exchange.symbols if s.endswith("/USDT")}
-    base = sorted((DEFAULT_FAVORITES | ALWAYS_INCLUDE) & available)
+    base = (DEFAULT_FAVORITES | ALWAYS_INCLUDE) & available
     if "working_symbols" not in st.session_state or not st.session_state["working_symbols"]:
-        st.session_state["working_symbols"] = base
+        st.session_state["working_symbols"] = sorted(base)
 
-# --- App UI -------------------------------------------------------------------
-st.set_page_config(page_title="Crypto Scanner", layout="wide")
-st.title("📈 Crypto Scanner (favorites + trending)")
+# ---------- UI ----------
+st.set_page_config(page_title="Crypto Parser", layout="wide")
+st.title("Crypto Parser – Watchlist & Trending")
 
-# Exchange picker (you can hardcode 'bitget' if you prefer)
-ex_name = st.sidebar.selectbox("Exchange", ["bitget", "binance", "okx"], index=0)
-ex = make_exchange(ex_name)
+ex = make_exchange("bitget")   # adjust if your helper expects something else
 _init_watchlist(ex)
 
-# Show where trending module was loaded from (debug)
-st.caption(f"trending loaded from: {trending_mod.__file__}")
+colL, colR = st.columns([2, 1])
+with colL:
+    st.subheader("📌 Current list")
+    st.write(", ".join(st.session_state["working_symbols"]))
 
-# --- Type-ahead add symbols ---------------------------------------------------
-st.subheader("Add symbols (type-ahead)")
-all_symbols = sorted([s for s in ex.symbols if s.endswith("/USDT")])
-typed = st.text_input("Search symbols (e.g., 'INJ', 'DOGE')", "")
-suggestions = [s for s in all_symbols if typed.upper() in s.upper()][:30]
-col1, col2 = st.columns([3,1])
-with col1:
-    sel = st.selectbox("Suggestions", suggestions) if suggestions else None
-with col2:
-    if st.button("➕ Add selected") and sel:
-        st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"] + [sel]))
+with colR:
+    st.subheader("➕ Add manually")
+    universe = sorted([s for s in ex.symbols if s.endswith("/USDT")])
+    add_symbol = st.selectbox("Add symbol", [""] + universe, index=0)
+    if add_symbol and add_symbol not in st.session_state["working_symbols"]:
+        st.session_state["working_symbols"].append(add_symbol)
+        st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
+        st.success(f"Added {add_symbol}")
 
-st.write("📌 Current list:", ", ".join(st.session_state["working_symbols"]))
+st.markdown("---")
+st.subheader("🔥 Find trending & explain why")
 
-# --- Trending screener --------------------------------------------------------
-st.subheader("Trending screener")
-params = TrendScanParams()
+params = TrendScanParams()  # tweak thresholds if needed
 
-if st.button("🔎 Find trending & add with reasons"):
-    df = scan_trending(ex, params=params)  # scans entire USDT universe by default
+if st.button("Scan market and add with reasons"):
+    df = scan_trending(ex, params=params)
 
     if df.empty:
-        st.info("No trending candidates returned.")
+        st.info("No trending candidates met the thresholds.")
     else:
-        # Show the top table
-        show_cols = ["symbol","score","pct4h","vol_z24h","sentiment_score","rsi14_15m","dist_to_low_pct","dist_to_high_pct"]
-        st.dataframe(df[show_cols].head(30), use_container_width=True)
+        st.dataframe(df[[
+            "symbol","score","pct4h","vol_z24h","sentiment_score",
+            "rsi14_15m","dist_to_low_pct","dist_to_high_pct"
+        ]].head(30))
 
-        # Add + show reasons
-        added: List[str] = []
-        for _, row in df.head(30).iterrows():
+        added = []
+        for _, row in df.iterrows():
             sym = row["symbol"]
             if sym not in st.session_state["working_symbols"]:
+                st.session_state["working_symbols"].append(sym)
                 reasons = explain_trending_row(row, params)
-                if reasons:
-                    st.session_state["working_symbols"].append(sym)
-                    added.append(f"➕ Added {sym}: " + "; ".join(reasons))
+                added.append((sym, reasons))
 
         st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
 
         if added:
-            for msg in added:
-                st.success(msg)
+            st.success("New symbols added:")
+            for sym, reasons in added:
+                st.write(f"• **{sym}** — " + "; ".join(reasons))
         else:
-            st.info("No new symbols added (either already present or thresholds not met).")
-
-# --- Footer -------------------------------------------------------------------
-st.markdown("---")
-st.write("Tip: favorites (incl. **GALA/USDT** and **XLM/USDT**) are always included on first load.")
+            st.info("No new symbols were added (already present or no reasons).")
