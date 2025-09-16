@@ -1,35 +1,33 @@
 # streamlit_app.py
 # -----------------------------------------------------------
-# Streamlit UI: favorites always present (incl. GALA, XLM),
-# trending scanner adds coins and explains why.
+# Always-include favorites (incl. GALA, XLM) + trend scan with reasons
 # -----------------------------------------------------------
 
 from __future__ import annotations
-
 import os, sys, importlib
 from typing import List
 import streamlit as st
 import pandas as pd
 from dataclasses import dataclass
 
-# ---------- Robust import of your utils ----------
+# --- Package setup ---
 ROOT_DIR = os.path.dirname(__file__)
-UTIL_DIR  = os.path.join(ROOT_DIR, "utiles")
+UTIL_DIR = os.path.join(ROOT_DIR, "utiles")
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 os.makedirs(UTIL_DIR, exist_ok=True)
 init_path = os.path.join(UTIL_DIR, "__init__.py")
 if not os.path.exists(init_path):
-    open(init_path, "a").close()  # ensure 'utiles' is a package
+    open(init_path, "a").close()
 
-# Exchange helper (uses your existing module)
+# --- Exchange helper ---
 try:
-    from utiles.bitget import make_exchange  # your project helper
+    from utiles.bitget import make_exchange
 except Exception as e:
     st.error(f"Failed to import utiles.bitget.make_exchange: {e}")
     st.stop()
 
-# Trending scanner module (import module, then pull symbols)
+# --- Trending module (module import, then getattr) ---
 try:
     trending_mod = importlib.import_module("utiles.trending")
 except Exception as e:
@@ -40,7 +38,7 @@ scan_trending = getattr(trending_mod, "scan_trending", None)
 explain_trending_row = getattr(trending_mod, "explain_trending_row", None)
 TrendScanParams = getattr(trending_mod, "TrendScanParams", None)
 
-# Fallbacks if module is missing some names (keeps app running)
+# Fallbacks so app keeps running even if symbols missing
 if TrendScanParams is None:
     @dataclass
     class TrendScanParams:
@@ -77,13 +75,12 @@ if scan_trending is None:
     st.error("utiles.trending is missing: scan_trending")
     st.stop()
 
-# ---------- Favorites / watchlist bootstrapping ----------
+# --- Favorites ---
 ALWAYS_INCLUDE = {"GALA/USDT", "XLM/USDT"}
-
 DEFAULT_FAVORITES = {
-    "BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT", "XRP/USDT",
-    "LINK/USDT", "AVAX/USDT", "TRX/USDT", "DOT/USDT", "LTC/USDT",
-    "INJ/USDT", "GRT/USDT", "CRO/USDT", "XTZ/USDT", "FET/USDT"
+    "BTC/USDT","ETH/USDT","SOL/USDT","ADA/USDT","XRP/USDT",
+    "LINK/USDT","AVAX/USDT","TRX/USDT","DOT/USDT","LTC/USDT",
+    "INJ/USDT","GRT/USDT","CRO/USDT","XTZ/USDT","FET/USDT",
 }
 
 def _init_watchlist(exchange):
@@ -92,11 +89,11 @@ def _init_watchlist(exchange):
     if "working_symbols" not in st.session_state or not st.session_state["working_symbols"]:
         st.session_state["working_symbols"] = sorted(base)
 
-# ---------- UI ----------
+# --- UI ---
 st.set_page_config(page_title="Crypto Parser", layout="wide")
-st.title("Crypto Parser – Watchlist & Trending")
+st.title("Crypto Parser — Watchlist & Trending")
 
-ex = make_exchange("bitget")   # adjust if your helper expects something else
+ex = make_exchange("bitget")
 _init_watchlist(ex)
 
 colL, colR = st.columns([2, 1])
@@ -116,7 +113,7 @@ with colR:
 st.markdown("---")
 st.subheader("🔥 Find trending & explain why")
 
-params = TrendScanParams()  # tweak thresholds if needed
+params = TrendScanParams()
 
 if st.button("Scan market and add with reasons"):
     df = scan_trending(ex, params=params)
@@ -138,7 +135,6 @@ if st.button("Scan market and add with reasons"):
                 added.append((sym, reasons))
 
         st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
-
         if added:
             st.success("New symbols added:")
             for sym, reasons in added:
