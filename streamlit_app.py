@@ -1,7 +1,7 @@
 # streamlit_app.py
 # -----------------------------------------------------------
-# Always-include favorites (incl. GALA, XLM) + trend scan with reasons.
-# Robust imports (no noisy fallbacks), clear UI.
+# Watchlist with always-included favorites (incl. GALA/XLM),
+# Trending scan with reasons, and a "Build snapshot" button.
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -63,9 +63,9 @@ except Exception as e:
     st.error(f"Failed to import utiles.trending: {e}")
     st.stop()
 
-scan_trending       = getattr(trending_mod, "scan_trending", None)
+scan_trending        = getattr(trending_mod, "scan_trending", None)
 explain_trending_row = getattr(trending_mod, "explain_trending_row", None)
-TrendScanParams     = getattr(trending_mod, "TrendScanParams", None)
+TrendScanParams      = getattr(trending_mod, "TrendScanParams", None)
 
 if TrendScanParams is None:
     @dataclass
@@ -119,10 +119,10 @@ def _init_watchlist(exchange):
 
 # --- UI ---
 st.set_page_config(page_title="Crypto Parser", layout="wide")
-st.title("Crypto Parser — Watchlist & Trending")
+st.title("Crypto Parser — Watchlist, Trending & Snapshots")
 
 ex = make_exchange("bitget")
-_ = ex.symbols  # force markets load early
+_ = ex.symbols  # force markets load
 _init_watchlist(ex)
 
 colL, colR = st.columns([2, 1])
@@ -145,28 +145,47 @@ st.subheader("🔥 Find trending & explain why")
 params = TrendScanParams()
 
 if st.button("Scan market and add with reasons"):
-    df = scan_trending(ex, params=params)
-
-    if df.empty:
-        st.info("No trending candidates met the thresholds.")
-    else:
-        st.dataframe(df[[
-            "symbol","score","pct4h","vol_z24h","sentiment_score",
-            "rsi14_15m","dist_to_low_pct","dist_to_high_pct"
-        ]].head(30))
-
-        added = []
-        for _, row in df.iterrows():
-            sym = row["symbol"]
-            if sym not in st.session_state["working_symbols"]:
-                st.session_state["working_symbols"].append(sym)
-                reasons = explain_trending_row(row, params)
-                added.append((sym, reasons))
-
-        st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
-        if added:
-            st.success("New symbols added:")
-            for sym, reasons in added:
-                st.write(f"• **{sym}** — " + "; ".join(reasons))
+    try:
+        df = scan_trending(ex, params=params)
+        if df.empty:
+            st.info("No trending candidates met the thresholds.")
         else:
-            st.info("No new symbols were added (already present or no reasons).")
+            st.dataframe(df[[
+                "symbol","score","pct4h","vol_z24h","sentiment_score",
+                "rsi14_15m","dist_to_low_pct","dist_to_high_pct"
+            ]].head(30))
+
+            added = []
+            for _, row in df.iterrows():
+                sym = row["symbol"]
+                if sym not in st.session_state["working_symbols"]:
+                    st.session_state["working_symbols"].append(sym)
+                    reasons = explain_trending_row(row, params)
+                    added.append((sym, reasons))
+
+            st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
+            if added:
+                st.success("New symbols added:")
+                for sym, reasons in added:
+                    st.write(f"• **{sym}** — " + "; ".join(reasons))
+            else:
+                st.info("No new symbols were added (already present or no reasons).")
+    except Exception as e:
+        st.error(f"Scan failed: {e}")
+
+st.markdown("---")
+st.subheader("📷 Build snapshot")
+
+try:
+    snap_mod = importlib.import_module("utiles.snapshot")
+except Exception as e:
+    st.error(f"Could not import snapshot module: {e}")
+    snap_mod = None
+
+if snap_mod and st.button("Build snapshot now"):
+    try:
+        snap = snap_mod.build_snapshot(ex, st.session_state["working_symbols"], timeframe="15m", limit=240)
+        st.success("Snapshot built successfully!")
+        st.json(snap)
+    except Exception as e:
+        st.error(f"Snapshot build failed: {e}")
