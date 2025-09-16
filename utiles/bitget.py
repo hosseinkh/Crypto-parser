@@ -1,10 +1,10 @@
 # utiles/bitget.py
 # -----------------------------------------------------------
 # ccxt wrapper exposing:
-#   • make_exchange()  → returns wrapper with .symbols and fetch_ohlcv()
-#   • get_exchange()   → alias for backward compatibility
-#   • ticker_bitget()  → lightweight one-off public ticker (used by ticks.py)
-#   • now_utc_iso()    → small helper (used elsewhere)
+#   • make_exchange()  → returns wrapper with .symbols + fetch_ohlcv()
+#   • get_exchange()   → alias
+#   • ticker_bitget()  → lightweight public ticker (used by ticks.py)
+#   • now_utc_iso()    → small helper
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -30,7 +30,6 @@ class _ExchangeWrapper:
 
         syms: List[str] = []
         for m in self.raw.markets.values():
-            # SPOT, active, quoted in USDT → “BTC/USDT”, etc.
             if m.get("spot") and m.get("active") and m.get("quote") == "USDT":
                 s = m.get("symbol")
                 if s:
@@ -72,9 +71,7 @@ def get_exchange(name: str = "bitget") -> _ExchangeWrapper:
 
 
 def ticker_bitget(symbol: str) -> Dict[str, Any]:
-    """
-    Lightweight public ticker. Returns {'last','bid','ask','ts'} or {'error':...}.
-    """
+    """Lightweight public ticker. Returns {'last','bid','ask','ts'} or {'error':...}."""
     ex = ccxt.bitget({"enableRateLimit": True, "timeout": 20000})
     try:
         t = ex.fetch_ticker(symbol)
