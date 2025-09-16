@@ -1,62 +1,52 @@
-# --- Robust import of utiles.trending with diagnostics ---
-import os, sys, traceback, importlib.util
-import streamlit as st
+# streamlit_app.py
+# -----------------------------------------------------------
+# Minimal, robust Streamlit app that:
+# - Ensures utiles/ is a package
+# - Loads trending module silently (no ImportError noise)
+# - Always includes Favorites + GALA + XLM
+# - Adds trending coins and shows human-readable reasons
+# -----------------------------------------------------------
 
+from __future__ import annotations
+
+import os, sys, importlib
+from typing import List, Set
+import streamlit as st
+import pandas as pd
+
+# --- Make sure 'utiles' is importable -----------------------------------------
 ROOT_DIR = os.path.dirname(__file__)
 UTIL_DIR = os.path.join(ROOT_DIR, "utiles")
-PKG_INIT = os.path.join(UTIL_DIR, "__init__.py")
-TREND_PATH = os.path.join(UTIL_DIR, "trending.py")
-
-# Make sure project root is on sys.path
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
+os.makedirs(UTIL_DIR, exist_ok=True)
+init_path = os.path.join(UTIL_DIR, "__init__.py")
+if not os.path.exists(init_path):
+    open(init_path, "a").close()  # create empty __init__.py
 
-# Ensure utiles is a proper package
-if not os.path.isdir(UTIL_DIR):
-    st.error(f"Folder not found: {UTIL_DIR}. Do you have 'utiles/' (not 'utils/')?")
-    st.stop()
-if not os.path.exists(PKG_INIT):
-    # create a blank __init__.py so Python recognizes the package
-    try:
-        open(PKG_INIT, "a").close()
-        st.warning("Created 'utiles/__init__.py' automatically.")
-    except Exception as _e:
-        st.error(f"Couldn't create {PKG_INIT}: {_e}")
-        st.stop()
-
-# Show what's inside for quick sanity
+# --- Exchange via ccxt (fallback if your own wrapper isn't present) -----------
 try:
-    st.caption("Contents of utiles/: " + ", ".join(sorted(os.listdir(UTIL_DIR))))
+    from utiles.bitget import make_exchange  # your helper if it exists
 except Exception:
-    pass
+    import ccxt  # type: ignore
 
-# Try the normal import first
+    def make_exchange(ex_name: str = "bitget"):
+        ex = getattr(ccxt, ex_name)()
+        ex.enableRateLimit = True
+        ex.load_markets()
+        return ex
+
+# --- Import trending module silently ------------------------------------------
 try:
-    from utiles.trending import scan_trending, explain_trending_row, TrendScanParams  # type: ignore
-    _IMPORTED_VIA = "package"
+    trending_mod = importlib.import_module("utiles.trending")
 except Exception as e:
-    st.warning(f"Standard import failed: {e!r}. Falling back to path loader…")
-    # Print full traceback so we see real cause (syntax error, missing dep, etc.)
-    st.code(traceback.format_exc())
-    if not os.path.exists(TREND_PATH):
-        st.error(f"Cannot find trending.py at {TREND_PATH}")
-        st.stop()
-    # Load by file path
-    spec = importlib.util.spec_from_file_location("utiles.trending", TREND_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(mod)  # executes trending.py — any errors will display above
-    except Exception:
-        st.error("Exception while executing utiles/trending.py:")
-        st.code(traceback.format_exc())
-        st.stop()
-    # Export names
-    scan_trending = getattr(mod, "scan_trending", None)
-    explain_trending_row = getattr(mod, "explain_trending_row", None)
-    TrendScanParams = getattr(mod, "TrendScanParams", None)
-    _IMPORTED_VIA = "file"
+    st.error(f"Failed to import utiles.trending: {e}")
+    st.stop()
 
-# Final sanity: all symbols present?
+scan_trending = getattr(trending_mod, "scan_trending", None)
+explain_trending_row = getattr(trending_mod, "explain_trending_row", None)
+TrendScanParams = getattr(trending_mod, "TrendScanParams", None)
+
 _missing = [n for n,v in {
     "scan_trending": scan_trending,
     "explain_trending_row": explain_trending_row,
@@ -66,4 +56,79 @@ if _missing:
     st.error("utiles.trending is missing: " + ", ".join(_missing))
     st.stop()
 
-st.success(f"Loaded utiles.trending via `{_IMPORTED_VIA}` import.")
+# --- Defaults / Favorites ------------------------------------------------------
+ALWAYS_INCLUDE: Set[str] = {"GALA/USDT", "XLM/USDT"}
+
+DEFAULT_FAVORITES: Set[str] = {
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "ADA/USDT", "XRP/USDT",
+    "LINK/USDT", "AVAX/USDT", "TRX/USDT", "DOT/USDT", "LTC/USDT",
+    "INJ/USDT", "GRT/USDT", "CRO/USDT", "XTZ/USDT", "FET/USDT"
+}
+
+def _init_watchlist(exchange):
+    available = {s for s in exchange.symbols if s.endswith("/USDT")}
+    base = sorted((DEFAULT_FAVORITES | ALWAYS_INCLUDE) & available)
+    if "working_symbols" not in st.session_state or not st.session_state["working_symbols"]:
+        st.session_state["working_symbols"] = base
+
+# --- App UI -------------------------------------------------------------------
+st.set_page_config(page_title="Crypto Scanner", layout="wide")
+st.title("📈 Crypto Scanner (favorites + trending)")
+
+# Exchange picker (you can hardcode 'bitget' if you prefer)
+ex_name = st.sidebar.selectbox("Exchange", ["bitget", "binance", "okx"], index=0)
+ex = make_exchange(ex_name)
+_init_watchlist(ex)
+
+# Show where trending module was loaded from (debug)
+st.caption(f"trending loaded from: {trending_mod.__file__}")
+
+# --- Type-ahead add symbols ---------------------------------------------------
+st.subheader("Add symbols (type-ahead)")
+all_symbols = sorted([s for s in ex.symbols if s.endswith("/USDT")])
+typed = st.text_input("Search symbols (e.g., 'INJ', 'DOGE')", "")
+suggestions = [s for s in all_symbols if typed.upper() in s.upper()][:30]
+col1, col2 = st.columns([3,1])
+with col1:
+    sel = st.selectbox("Suggestions", suggestions) if suggestions else None
+with col2:
+    if st.button("➕ Add selected") and sel:
+        st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"] + [sel]))
+
+st.write("📌 Current list:", ", ".join(st.session_state["working_symbols"]))
+
+# --- Trending screener --------------------------------------------------------
+st.subheader("Trending screener")
+params = TrendScanParams()
+
+if st.button("🔎 Find trending & add with reasons"):
+    df = scan_trending(ex, params=params)  # scans entire USDT universe by default
+
+    if df.empty:
+        st.info("No trending candidates returned.")
+    else:
+        # Show the top table
+        show_cols = ["symbol","score","pct4h","vol_z24h","sentiment_score","rsi14_15m","dist_to_low_pct","dist_to_high_pct"]
+        st.dataframe(df[show_cols].head(30), use_container_width=True)
+
+        # Add + show reasons
+        added: List[str] = []
+        for _, row in df.head(30).iterrows():
+            sym = row["symbol"]
+            if sym not in st.session_state["working_symbols"]:
+                reasons = explain_trending_row(row, params)
+                if reasons:
+                    st.session_state["working_symbols"].append(sym)
+                    added.append(f"➕ Added {sym}: " + "; ".join(reasons))
+
+        st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
+
+        if added:
+            for msg in added:
+                st.success(msg)
+        else:
+            st.info("No new symbols added (either already present or thresholds not met).")
+
+# --- Footer -------------------------------------------------------------------
+st.markdown("---")
+st.write("Tip: favorites (incl. **GALA/USDT** and **XLM/USDT**) are always included on first load.")
