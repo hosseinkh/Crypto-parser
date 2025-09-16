@@ -1,6 +1,7 @@
 # streamlit_app.py
 # -----------------------------------------------------------
-# Always-include favorites (incl. GALA, XLM) + trend scan with reasons
+# Always-include favorites (incl. GALA, XLM) + trend scan with reasons.
+# Robust imports (no noisy fallbacks), clear UI.
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -12,7 +13,7 @@ from dataclasses import dataclass
 
 # --- Package setup ---
 ROOT_DIR = os.path.dirname(__file__)
-UTIL_DIR = os.path.join(ROOT_DIR, "utiles")
+UTIL_DIR  = os.path.join(ROOT_DIR, "utiles")
 if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 os.makedirs(UTIL_DIR, exist_ok=True)
@@ -20,25 +21,52 @@ init_path = os.path.join(UTIL_DIR, "__init__.py")
 if not os.path.exists(init_path):
     open(init_path, "a").close()
 
-# --- Exchange helper ---
+# --- Exchange helper (module import + safe fallback) ---
 try:
-    from utiles.bitget import make_exchange
+    bitget_mod = importlib.import_module("utiles.bitget")
 except Exception as e:
-    st.error(f"Failed to import utiles.bitget.make_exchange: {e}")
+    st.error(f"Failed to import module utiles.bitget: {e}")
     st.stop()
 
-# --- Trending module (module import, then getattr) ---
+def _fallback_make_exchange(name: str = "bitget"):
+    try:
+        import ccxt  # type: ignore
+        name = (name or "bitget").lower()
+        cls = getattr(ccxt, name)
+        ex = cls({"enableRateLimit": True, "timeout": 20000, "options": {"defaultType": "spot"}})
+        class _Wrap:
+            def __init__(self, ex):
+                self.raw = ex
+                try:
+                    self.raw.load_markets(reload=False)
+                except Exception:
+                    self.raw.load_markets(reload=True)
+                self.symbols = sorted(
+                    set(
+                        m["symbol"] for m in self.raw.markets.values()
+                        if m.get("spot") and m.get("active") and m.get("quote") == "USDT"
+                    )
+                )
+            def fetch_ohlcv(self, *a, **k):
+                return self.raw.fetch_ohlcv(*a, **k)
+        return _Wrap(ex)
+    except Exception as e:
+        st.error(f"Fallback make_exchange failed: {e}")
+        st.stop()
+
+make_exchange = getattr(bitget_mod, "make_exchange", _fallback_make_exchange)
+
+# --- Trending module (import + getattr, with graceful fallbacks) ---
 try:
     trending_mod = importlib.import_module("utiles.trending")
 except Exception as e:
     st.error(f"Failed to import utiles.trending: {e}")
     st.stop()
 
-scan_trending = getattr(trending_mod, "scan_trending", None)
+scan_trending       = getattr(trending_mod, "scan_trending", None)
 explain_trending_row = getattr(trending_mod, "explain_trending_row", None)
-TrendScanParams = getattr(trending_mod, "TrendScanParams", None)
+TrendScanParams     = getattr(trending_mod, "TrendScanParams", None)
 
-# Fallbacks so app keeps running even if symbols missing
 if TrendScanParams is None:
     @dataclass
     class TrendScanParams:
@@ -75,7 +103,7 @@ if scan_trending is None:
     st.error("utiles.trending is missing: scan_trending")
     st.stop()
 
-# --- Favorites ---
+# --- Favorites / watchlist bootstrapping ---
 ALWAYS_INCLUDE = {"GALA/USDT", "XLM/USDT"}
 DEFAULT_FAVORITES = {
     "BTC/USDT","ETH/USDT","SOL/USDT","ADA/USDT","XRP/USDT",
@@ -94,6 +122,7 @@ st.set_page_config(page_title="Crypto Parser", layout="wide")
 st.title("Crypto Parser — Watchlist & Trending")
 
 ex = make_exchange("bitget")
+_ = ex.symbols  # force markets load early
 _init_watchlist(ex)
 
 colL, colR = st.columns([2, 1])
