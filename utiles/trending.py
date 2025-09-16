@@ -1,7 +1,7 @@
 # utiles/trending.py
 # -----------------------------------------------------------
-# Trend scanner + human-readable reasons for additions.
-# Works with ccxt exchanges and your indicators engine.
+# Trend scanner + human-readable reasons for why a symbol
+# was added. Works with your indicators engine.
 # -----------------------------------------------------------
 
 from __future__ import annotations
@@ -18,13 +18,8 @@ try:
 except Exception:  # local dev fallback
     from .indicators import compute_indicators  # type: ignore
 
-
-# --- Sentiment hook (safe if not configured) ----------------
+# Optional sentiment hook — safe if missing
 def _get_sentiment_score(symbol: str) -> float:
-    """
-    Try to pull a score from utiles.sentiment.get_sentiment_for_symbol(symbol).
-    If unavailable or errors, return 0.0
-    """
     try:
         from utiles.sentiment import get_sentiment_for_symbol
         score, _label = get_sentiment_for_symbol(symbol)
@@ -33,7 +28,7 @@ def _get_sentiment_score(symbol: str) -> float:
         return 0.0
 
 
-# --- Parameters / thresholds --------------------------------
+# ---------- Parameters / thresholds ----------
 @dataclass
 class TrendScanParams:
     timeframe: str = "15m"
@@ -54,7 +49,7 @@ class TrendScanParams:
         return {"5m": 288, "15m": 96, "30m": 48, "1h": 24}.get(self.timeframe, 96)
 
 
-# --- Utilities ----------------------------------------------
+# ---------- Internal helpers ----------
 def _pct_change_over_n(df: pd.DataFrame, n: int) -> float:
     if df.shape[0] <= n:
         return float("nan")
@@ -81,12 +76,12 @@ def _compute_24h_vol_z(df: pd.DataFrame, bars_24h: int, window: int = 20) -> flo
     return _zscore_last(sums.dropna(), window=window, ddof=1)
 
 
-# --- Human-readable reasons ---------------------------------
+# ---------- Human-readable reasons ----------
 def explain_trending_row(row: pd.Series, p: TrendScanParams) -> List[str]:
     """
     Build reasons for why a row (symbol) is considered 'trending'.
-    Requires columns: pct4h, vol_z24h, rsi14_15m, sentiment_score,
-                      dist_to_low_pct, dist_to_high_pct.
+    Expects columns: pct4h, vol_z24h, rsi14_15m, sentiment_score,
+                     dist_to_low_pct, dist_to_high_pct.
     """
     reasons: List[str] = []
     if pd.notna(row.get("pct4h")) and row["pct4h"] >= p.min_pct_4h:
@@ -108,7 +103,7 @@ def explain_trending_row(row: pd.Series, p: TrendScanParams) -> List[str]:
     return reasons
 
 
-# --- Main scan ----------------------------------------------
+# ---------- Main scan ----------
 def scan_trending(
     exchange,
     universe: Optional[Iterable[str]] = None,
