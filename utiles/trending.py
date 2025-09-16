@@ -136,39 +136,28 @@ def scan_trending(
             pct4h = _pct_change_over_n(df, n=bars_4h)
             volz24 = _compute_24h_vol_z(df, bars_24h=bars_24h, window=20)
 
-            dist_low_pct = float(ind["dist_to_range_low"].iloc[-1]) if "dist_to_range_low" in ind else float("nan")
+            dist_low_pct  = float(ind["dist_to_range_low"].iloc[-1])  if "dist_to_range_low"  in ind else float("nan")
             dist_high_pct = float(ind["dist_to_range_high"].iloc[-1]) if "dist_to_range_high" in ind else float("nan")
             rsi_15m = float(ind["rsi_14"].iloc[-1]) if "rsi_14" in ind else float("nan")
 
-            rows.append(
-                {
-                    "symbol": sym,
-                    "last": float(df["close"].iloc[-1]),
-                    "pct4h": pct4h,
-                    "vol_z24h": volz24,
-                    "rsi14_15m": rsi_15m,
-                    "sentiment_score": _get_sentiment_score(sym),
-                    "dist_to_low_pct": dist_low_pct,
-                    "dist_to_high_pct": dist_high_pct,
-                }
-            )
+            rows.append({
+                "symbol": sym,
+                "last": float(df["close"].iloc[-1]),
+                "pct4h": pct4h,
+                "vol_z24h": volz24,
+                "rsi14_15m": rsi_15m,
+                "sentiment_score": _get_sentiment_score(sym),
+                "dist_to_low_pct": dist_low_pct,
+                "dist_to_high_pct": dist_high_pct,
+            })
         except Exception:
             continue
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "symbol",
-                "last",
-                "pct4h",
-                "vol_z24h",
-                "rsi14_15m",
-                "sentiment_score",
-                "dist_to_low_pct",
-                "dist_to_high_pct",
-                "score",
-            ]
-        )
+        return pd.DataFrame(columns=[
+            "symbol","last","pct4h","vol_z24h","rsi14_15m","sentiment_score",
+            "dist_to_low_pct","dist_to_high_pct","score"
+        ])
 
     df = pd.DataFrame(rows)
 
@@ -178,18 +167,18 @@ def scan_trending(
         return (col - col.mean()) / (sd if sd and not math.isnan(sd) else 1.0)
 
     df["score"] = (
-        0.4 * _z(df["vol_z24h"].fillna(0))
-        + 0.4 * _z(df["pct4h"].fillna(0))
-        + 0.2 * _z(df["sentiment_score"].fillna(0))
+        0.4*_z(df["vol_z24h"].fillna(0)) +
+        0.4*_z(df["pct4h"].fillna(0)) +
+        0.2*_z(df["sentiment_score"].fillna(0))
     )
-    df.loc[df["dist_to_low_pct"] <= params.near_support_max_pct, "score"] += 0.10
+    df.loc[df["dist_to_low_pct"]  <= params.near_support_max_pct, "score"] += 0.10
     df.loc[df["dist_to_high_pct"] <= params.near_resist_max_pct, "score"] += 0.05
 
-    # Keep candidates meeting at least one hard threshold
+    # Hard thresholds to keep candidates
     keep_mask = (
-        (df["pct4h"] >= params.min_pct_4h)
-        | (df["vol_z24h"] >= params.min_volz_24h)
-        | ((df["rsi14_15m"] >= params.rsi15m_min) & (df["rsi14_15m"] <= params.rsi15m_max))
+        (df["pct4h"] >= params.min_pct_4h) |
+        (df["vol_z24h"] >= params.min_volz_24h) |
+        ((df["rsi14_15m"] >= params.rsi15m_min) & (df["rsi14_15m"] <= params.rsi15m_max))
     )
     return df.loc[keep_mask].sort_values("score", ascending=False).reset_index(drop=True)
 
