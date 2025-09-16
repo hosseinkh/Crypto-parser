@@ -1,19 +1,17 @@
 # streamlit_app.py
 # -----------------------------------------------------------
-# Watchlist with always-included favorites (incl. GALA/XLM),
-# Trending scan with reasons (shows count + table of NEW adds),
-# and "Build snapshot" with download buttons (JSON + CSV).
+# Watchlist (favorites incl. GALA/XLM) + Trending with reasons
+# + Build Snapshot (v4.1) button and downloader.
 # -----------------------------------------------------------
 
 from __future__ import annotations
-import os, sys, importlib, json, io
-from datetime import datetime, timezone
+import os, sys, importlib, json
 from typing import List
 import streamlit as st
 import pandas as pd
 from dataclasses import dataclass
 
-# --- Package setup ---
+# --- Package bootstrap ---
 ROOT_DIR = os.path.dirname(__file__)
 UTIL_DIR  = os.path.join(ROOT_DIR, "utiles")
 if ROOT_DIR not in sys.path:
@@ -27,7 +25,7 @@ if not os.path.exists(init_path):
 try:
     bitget_mod = importlib.import_module("utiles.bitget")
 except Exception as e:
-    st.error(f"Failed to import module utiles.bitget: {e}")
+    st.error(f"Failed to import utiles.bitget: {e}")
     st.stop()
 
 def _fallback_make_exchange(name: str = "bitget"):
@@ -44,10 +42,8 @@ def _fallback_make_exchange(name: str = "bitget"):
                 except Exception:
                     self.raw.load_markets(reload=True)
                 self.symbols = sorted(
-                    set(
-                        m["symbol"] for m in self.raw.markets.values()
-                        if m.get("spot") and m.get("active") and m.get("quote") == "USDT"
-                    )
+                    set(m["symbol"] for m in self.raw.markets.values()
+                        if m.get("spot") and m.get("active") and m.get("quote") == "USDT")
                 )
             def fetch_ohlcv(self, *a, **k):
                 return self.raw.fetch_ohlcv(*a, **k)
@@ -58,7 +54,7 @@ def _fallback_make_exchange(name: str = "bitget"):
 
 make_exchange = getattr(bitget_mod, "make_exchange", _fallback_make_exchange)
 
-# --- Trending module (import + getattr, with graceful fallbacks) ---
+# --- Trending module ---
 try:
     trending_mod = importlib.import_module("utiles.trending")
 except Exception as e:
@@ -105,7 +101,7 @@ if scan_trending is None:
     st.error("utiles.trending is missing: scan_trending")
     st.stop()
 
-# --- Favorites / watchlist bootstrapping ---
+# --- Favorites / watchlist ---
 ALWAYS_INCLUDE = {"GALA/USDT", "XLM/USDT"}
 DEFAULT_FAVORITES = {
     "BTC/USDT","ETH/USDT","SOL/USDT","ADA/USDT","XRP/USDT",
@@ -119,12 +115,12 @@ def _init_watchlist(exchange):
     if "working_symbols" not in st.session_state or not st.session_state["working_symbols"]:
         st.session_state["working_symbols"] = sorted(base)
 
-# --- UI ---
-st.set_page_config(page_title="Crypto Parser", layout="wide")
-st.title("Crypto Parser — Watchlist, Trending & Snapshots")
+# --- Page ---
+st.set_page_config(page_title="Crypto Parser — LLM Snapshot", layout="wide")
+st.title("Crypto Parser — Watchlist, Trending & LLM Snapshot (v4.1)")
 
 ex = make_exchange("bitget")
-_ = ex.symbols  # force markets load
+_ = ex.symbols
 _init_watchlist(ex)
 
 colL, colR = st.columns([2, 1])
@@ -149,50 +145,34 @@ params = TrendScanParams()
 if st.button("Scan market and add with reasons"):
     try:
         df = scan_trending(ex, params=params)
-
         if df.empty:
             st.info("No trending candidates met the thresholds.")
         else:
-            # Determine which ones are NEW (not already on the list)
-            current_set = set(st.session_state["working_symbols"])
-            df_new = df[~df["symbol"].isin(current_set)].copy()
+            st.dataframe(df[[
+                "symbol","score","pct4h","vol_z24h","sentiment_score",
+                "rsi14_15m","dist_to_low_pct","dist_to_high_pct"
+            ]].head(30))
 
-            # Build a 'reasons' column for the NEW ones
-            df_new["reasons"] = df_new.apply(lambda r: "; ".join(explain_trending_row(r, params)), axis=1)
-
-            # Show count + table of NEW additions
-            to_add_count = len(df_new)
-            st.markdown(f"**Will add:** `{to_add_count}` symbols")
-            if to_add_count:
-                st.dataframe(
-                    df_new[["symbol", "score", "pct4h", "vol_z24h", "sentiment_score", "rsi14_15m", "reasons"]]
-                    .reset_index(drop=True)
-                )
-
-            # Show also the full ranked list (for context)
-            with st.expander("See full ranked scan (all candidates)"):
-                st.dataframe(
-                    df[["symbol","score","pct4h","vol_z24h","sentiment_score","rsi14_15m","dist_to_low_pct","dist_to_high_pct"]]
-                    .reset_index(drop=True)
-                )
-
-            # Add NEW ones to watchlist
             added = []
-            for _, row in df_new.iterrows():
+            for _, row in df.iterrows():
                 sym = row["symbol"]
-                st.session_state["working_symbols"].append(sym)
-                added.append(sym)
+                if sym not in st.session_state["working_symbols"]:
+                    st.session_state["working_symbols"].append(sym)
+                    reasons = explain_trending_row(row, params)
+                    added.append((sym, reasons))
 
             st.session_state["working_symbols"] = sorted(set(st.session_state["working_symbols"]))
-            st.success(f"Added {len(added)} new symbol(s): " + (", ".join(added) if added else "—"))
+            if added:
+                st.success("New symbols added:")
+                for sym, reasons in added:
+                    st.write(f"• **{sym}** — " + "; ".join(reasons))
+            else:
+                st.info("No new symbols were added (already present or no reasons).")
     except Exception as e:
         st.error(f"Scan failed: {e}")
 
 st.markdown("---")
-st.subheader("📷 Build snapshot")
-
-def _utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+st.subheader("📷 Build snapshot (v4.1)")
 
 try:
     snap_mod = importlib.import_module("utiles.snapshot")
@@ -202,33 +182,15 @@ except Exception as e:
 
 if snap_mod and st.button("Build snapshot now"):
     try:
-        snap = snap_mod.build_snapshot(ex, st.session_state["working_symbols"], timeframe="15m", limit=240)
+        snap = snap_mod.build_snapshot_v41(
+            ex, st.session_state["working_symbols"],
+            timeframe="15m", limit=240, quote_asset="USDT", exchange_name="bitget"
+        )
         st.success("Snapshot built successfully!")
         st.json(snap)
 
-        # --- Download buttons ---
-        ts = _utc_iso()
-
-        # JSON
-        json_bytes = json.dumps(snap, ensure_ascii=False, indent=2).encode("utf-8")
-        st.download_button(
-            label="⬇️ Download snapshot (JSON)",
-            data=json_bytes,
-            file_name=f"snapshot_{ts}.json",
-            mime="application/json",
-        )
-
-        # CSV (flatten items)
-        items = snap.get("items", [])
-        if items:
-            df_items = pd.DataFrame(items)
-            csv_buf = io.StringIO()
-            df_items.to_csv(csv_buf, index=False)
-            st.download_button(
-                label="⬇️ Download snapshot items (CSV)",
-                data=csv_buf.getvalue().encode("utf-8"),
-                file_name=f"snapshot_items_{ts}.csv",
-                mime="text/csv",
-            )
+        # Download
+        fname = f"snapshot_{snap.get('schema_version','4.1')}_{snap.get('generated_at_utc','').replace(':','').replace('.','')}.json"
+        st.download_button("⬇️ Download snapshot JSON", data=json.dumps(snap, indent=2), file_name=fname, mime="application/json")
     except Exception as e:
         st.error(f"Snapshot build failed: {e}")
