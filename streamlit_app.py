@@ -59,9 +59,8 @@ st.header("📸 Build snapshot (v4.1)")
 ex = make_exchange(exchange_name)
 cap_tfs = []
 try:
-    # ccxt exchanges expose supported timeframes here; if not present, we fallback
     if getattr(ex, "timeframes", None):
-        cap_tfs = [tf for tf in ex.timeframes.keys()]
+        cap_tfs = list(ex.timeframes.keys())
 except Exception:
     pass
 
@@ -69,14 +68,12 @@ FALLBACK_TFS = ["1m","5m","15m","30m","1h","2h","4h","6h","12h","1d"]
 ALL_TFS = sorted(set(cap_tfs or FALLBACK_TFS),
                  key=lambda x: (x[-1], float(x[:-1]) if x[:-1].isdigit() else 0))
 
-# 🔧 Force multi-select with a NEW widget key so Streamlit doesn’t reuse the old single-select state
 timeframes = st.multiselect(
     "Timeframes (multi-select)",
     ALL_TFS,
     default=[tf for tf in ["15m", "1h", "4h"] if tf in ALL_TFS],
     key="tfs_v41_multiselect",
 )
-# Debug line so you can confirm what the app sees
 st.caption(f"Available TFs: {', '.join(ALL_TFS)} | Selected: {', '.join(timeframes or DEFAULT_TFS)}")
 
 candles_limit = st.number_input(
@@ -84,11 +81,14 @@ candles_limit = st.number_input(
 )
 
 if st.button("Build snapshot now", key="build_snapshot_btn"):
+    # ✅ Limit the snapshot strictly to the working list so it’s fast
+    working_universe = favorites[:]  # favorites + any trending you added above
     sparams = SnapshotParams.with_defaults(
         timeframes=timeframes or DEFAULT_TFS,
         candles_limit=candles_limit,
         exchange_name=exchange_name,
         favorites=favorites,
+        universe=working_universe,    # <-- key fix for speed
         meta={
             "ui_timeframes": timeframes or DEFAULT_TFS,
             "ui_favorites": favorites,
