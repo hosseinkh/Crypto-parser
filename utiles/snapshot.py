@@ -6,6 +6,7 @@ from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .bitget import make_exchange, fetch_ohlcv_safe, fetch_ticker_safe
+from .sentiment import get_sentiment_for_symbol
 
 # ------------------------ indicators (self-contained) -------------------------
 
@@ -76,6 +77,7 @@ class SnapshotParams:
     exchange_name: str = "bitget"
     favorites: Optional[List[str]] = None
     universe: Optional[List[str]] = None
+    include_sentiment: bool = True      # ✅ new flag
     meta: Optional[Dict[str, Any]] = None
 
     @staticmethod
@@ -99,9 +101,7 @@ def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
 
 def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
     """
-    Fast multi-timeframe snapshot:
-      * builds ONLY for `params.universe` (or favorites)
-      * downloads per symbol in a small thread pool (rate-limit friendly)
+    Fast multi-timeframe snapshot with optional sentiment per symbol.
     """
     ex = make_exchange(params.exchange_name)
 
@@ -122,6 +122,16 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                     "timeframe": tf,
                 }
             tick = fetch_ticker_safe(ex, symbol)
+
+            # ✅ Sentiment (optional)
+            sentiment_block = None
+            if params.include_sentiment:
+                sent_score, sent_details = get_sentiment_for_symbol(symbol)
+                sentiment_block = {
+                    "score": sent_score,          # [-1 .. +1]
+                    "details": sent_details,      # provider breakdown
+                }
+
             return symbol, {
                 "symbol": symbol,
                 "timeframes": tf_blocks,
@@ -131,13 +141,13 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                     "ask": tick.get("ask"),
                     "ts": tick.get("timestamp"),
                 },
+                "sentiment": sentiment_block,     # ✅ included
                 "meta": {"exchange": ex.id},
             }
         except Exception as e:
             return symbol, {"symbol": symbol, "error": str(e)}
 
     items: Dict[str, Any] = {}
-    # 4–6 threads is generally safe for Bitget public endpoints
     with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {pool.submit(work, s): s for s in all_symbols}
         for fut in as_completed(futures):
