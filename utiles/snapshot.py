@@ -64,22 +64,21 @@ def dist_to_extremes_pct(ohlcv: List[List[float]], lookback: int = 120) -> Dict[
     to_low = (lc - low) / lc * 100.0 if lc else float("nan")
     return {"to_high_pct": to_high, "to_low_pct": to_low}
 
-# --- >>> ADDED: helpers for exit intelligence metrics -------------------------
+# --- ADDED: helpers for exit-intelligence metrics -----------------------------
 
 def _vpr10_features(ohlcv: List[List[float]]) -> Dict[str, Any]:
     """
-    Volume Pulse Ratio over 10 bars:
+    Volume Pulse Ratio (VPR10):
       vpr10 = current_volume / mean(prev 10 volumes)
-    Also exposes a momentum-fade flag if last 3 vpr10 readings < 0.8.
+    Plus a simple momentum-fade flag if the last 3 vpr10 readings < 0.8.
     """
     vols = [x[5] for x in ohlcv]
     out = {"vpr10": float("nan"), "vpr10_lt_0_8_last3": False}
-    if len(vols) < 12:  # need at least 11 bars for first vpr10
+    if len(vols) < 12:
         return out
     denom = statistics.mean(vols[-11:-1]) or 1e-12
     out["vpr10"] = vols[-1] / denom
 
-    # compute last 3 vpr10 values
     try:
         vprs = []
         for k in (0, 1, 2):
@@ -91,16 +90,11 @@ def _vpr10_features(ohlcv: List[List[float]]) -> Dict[str, Any]:
     return out
 
 def _last_two(vals: List[float]) -> Tuple[float, float]:
-    """Return (last, previous) with NaNs if unavailable."""
     if len(vals) >= 2:
         return vals[-1], vals[-2]
     return float("nan"), float("nan")
 
 def _rsi_prev(values: List[float], period: int = 14) -> float:
-    """
-    Previous-bar RSI value (compute RSI on all but the last bar).
-    Returns NaN if not enough data.
-    """
     if len(values) < period + 2:
         return float("nan")
     return rsi(values[:-1], period=period)
@@ -118,7 +112,7 @@ class SnapshotParams:
     exchange_name: str = "bitget"
     favorites: Optional[List[str]] = None
     universe: Optional[List[str]] = None
-    include_sentiment: bool = True      # ✅ new flag
+    include_sentiment: bool = True
     meta: Optional[Dict[str, Any]] = None
 
     @staticmethod
@@ -137,7 +131,7 @@ def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
     }
     feats.update(dist_to_extremes_pct(ohlcv, lookback=120))
 
-    # --- >>> ADDED: VPR10 metrics (volume pulse ratio) ------------------------
+    # --- ADDED: VPR10 metrics (Layer 2)
     vpr_block = _vpr10_features(ohlcv)
     feats.update(vpr_block)  # adds feats["vpr10"], feats["vpr10_lt_0_8_last3"]
 
@@ -160,19 +154,20 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
     def work(symbol: str) -> Tuple[str, Any]:
         try:
             tf_blocks: Dict[str, Any] = {}
-            ohlcv_by_tf: Dict[str, List[List[float]]] = {}   # --- >>> ADDED
+            ohlcv_by_tf: Dict[str, List[List[float]]] = {}   # for optional cross-TF derived metrics
 
             for tf in params.timeframes:
                 ohlcv = fetch_ohlcv_safe(ex, symbol, tf, params.candles_limit)
-                ohlcv_by_tf[tf] = ohlcv                         # --- >>> ADDED
+                ohlcv_by_tf[tf] = ohlcv
                 tf_blocks[tf] = {
                     "features": _compute_features_for_tf(ohlcv),
                     "ohlcv_len": len(ohlcv),
                     "timeframe": tf,
                 }
+
             tick = fetch_ticker_safe(ex, symbol)
 
-            # ✅ Sentiment (optional)
+            # Sentiment (optional)
             sentiment_block = None
             if params.include_sentiment:
                 sent_score, sent_details = get_sentiment_for_symbol(symbol)
@@ -181,11 +176,10 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                     "details": sent_details,      # provider breakdown
                 }
 
-            # --- >>> ADDED: Derived micro-momentum divergence (5m vs 15m) ----
+            # Optional: micro-divergence (Layer 1) — harmless if 5m not selected
             derived_block = None
             if ("5m" in ohlcv_by_tf) and ("15m" in tf_blocks):
                 closes_5m = [x[4] for x in ohlcv_by_tf["5m"]]
-                closes_15m = [x[4] for x in ohlcv_by_tf["15m"]]
                 rsi5_now = rsi(closes_5m, period=14)
                 rsi5_prev = _rsi_prev(closes_5m, period=14)
                 rsi15_now = tf_blocks["15m"]["features"]["rsi"]
@@ -194,8 +188,6 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                 rsi_gap = rsi5_now - rsi15_now
                 price_higher_high = (c_now > c_prev)
                 rsi5_lower_high = (rsi5_now < rsi5_prev)
-
-                # Exhaustion when 5m underperforms 15m by ≥5 AND price HH while RSI LH
                 exhaustion = (rsi_gap <= -5.0) and price_higher_high and rsi5_lower_high
 
                 derived_block = {
@@ -219,8 +211,8 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                     "ask": tick.get("ask"),
                     "ts": tick.get("timestamp"),
                 },
-                "sentiment": sentiment_block,     # ✅ included
-                "derived": derived_block,         # --- >>> ADDED (optional)
+                "sentiment": sentiment_block,
+                "derived": derived_block,   # may be None (safe)
                 "meta": {"exchange": ex.id},
             }
         except Exception as e:
@@ -233,7 +225,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             s, item = fut.result()
             items[s] = item
 
-    # --- >>> ADDED: BTC Anchor Bias (market context) -------------------------
+    # --- ADDED: BTC Anchor Bias (Layer 3) ------------------------------------
     def _get_first_key(d: Dict[str, Any], keys: List[str]) -> Optional[str]:
         for k in keys:
             if k in d:
@@ -246,7 +238,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
         btc_15 = items[btc_key]["timeframes"]["15m"]["features"].get("rsi")
         btc_1h = items[btc_key]["timeframes"]["1h"]["features"].get("rsi")
 
-        # Simple definition: bear bias if short-term weak AND 1h below neutral
+        # Bear bias if short-term is weak AND 1h is below neutral
         bear_bias = (isinstance(btc_15, float) and btc_15 < 45.0) and (isinstance(btc_1h, float) and btc_1h < 50.0)
 
         market_block["btc_anchor_bias"] = {
@@ -256,7 +248,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             "anchor_symbol": btc_key,
         }
 
-        # Mirror boolean on each symbol for convenience
+        # Mirror boolean to each symbol for convenience
         for sym, item in items.items():
             if isinstance(item, dict):
                 item.setdefault("derived", {})
@@ -269,6 +261,6 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
         "candles_limit": params.candles_limit,
         "exchange": ex.id,
         "items": items,
-        "market": market_block,   # --- >>> ADDED (top-level)
+        "market": market_block,   # (new)
         "meta": params.meta or {},
     }
