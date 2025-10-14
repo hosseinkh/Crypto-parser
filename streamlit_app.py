@@ -120,6 +120,13 @@ if st.button("Scan market and add Top-N with reasons"):
 st.markdown("---")
 
 # -------------------------- Build Snapshot (v4.1) -----------------------------
+st.markdown(
+    "<div style='display:inline-block;padding:4px 8px;border-radius:8px;"
+    "background:#e8f5e9;color:#1b5e20;font-weight:600;'>Closed candles only ✓</div>"
+    "<span style='margin-left:8px;color:#555;'>Aligned across TFs (15m/1h/4h)</span>",
+    unsafe_allow_html=True
+)
+
 st.header("📸 Build snapshot (v4.1)")
 
 cap_tfs = []
