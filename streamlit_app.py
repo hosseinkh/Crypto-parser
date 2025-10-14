@@ -2,7 +2,7 @@
 from __future__ import annotations
 import json, io
 import streamlit as st
-from typing import List
+from typing import List, Dict, Any
 
 from utiles.snapshot import SnapshotParams, build_snapshot_v41, DEFAULT_TFS
 from utiles.trending import scan_trending, explain_trending_row, TrendScanParams
@@ -20,6 +20,31 @@ default_list = st.sidebar.text_area(
 base_list = [s.strip().upper() for s in default_list.split(",") if s.strip()]
 
 ALWAYS_INCLUDE = ["GALA/USDT", "XLM/USDT"]
+
+# NEW: Active-trade mode (adds 5m for L1/L0 logic) + optional positions map
+active_trade_mode = st.sidebar.checkbox("Active-trade mode (adds 5m TF)", value=False)
+st.sidebar.caption("Adds 5m so micro-divergence (L1) & early partial (L0) can work.")
+
+positions_text = st.sidebar.text_area(
+    "Positions (optional: one per line, e.g.  SOL/USDT=132.5 )",
+    value="",
+    help="If provided, snapshot computes profit_pct & ATR gain multiple for early partials."
+)
+
+def _parse_positions(text: str) -> Dict[str, Dict[str, Any]]:
+    pos: Dict[str, Dict[str, Any]] = {}
+    for ln in (text or "").splitlines():
+        ln = ln.strip()
+        if not ln or "=" not in ln:
+            continue
+        sym, px = ln.split("=", 1)
+        sym = sym.strip().upper()
+        try:
+            price = float(px.strip())
+        except Exception:
+            continue
+        pos[sym] = {"entry_price": price}
+    return pos
 
 if "working_symbols" not in st.session_state:
     st.session_state["working_symbols"] = sorted(set(base_list + ALWAYS_INCLUDE))
@@ -107,13 +132,19 @@ FALLBACK_TFS = ["1m","5m","15m","30m","1h","2h","4h","6h","12h","1d"]
 ALL_TFS = sorted(set(cap_tfs or FALLBACK_TFS),
                  key=lambda x: (x[-1], float(x[:-1]) if x[:-1].isdigit() else 0))
 
+# Default selection keeps your original, but we may add 5m in active mode
+default_sel = [tf for tf in ["15m", "1h", "4h"] if tf in ALL_TFS]
 timeframes = st.multiselect(
     "Timeframes (multi-select)",
     ALL_TFS,
-    default=[tf for tf in ["15m", "1h", "4h"] if tf in ALL_TFS],
+    default=default_sel,
     key="tfs_v41_multiselect",
 )
 st.caption(f"Available TFs: {', '.join(ALL_TFS)} | Selected: {', '.join(timeframes or DEFAULT_TFS)}")
+
+# If active-trade mode, ensure 5m is included (for L1 micro-div & smoother L0)
+if active_trade_mode and "5m" in ALL_TFS and "5m" not in timeframes:
+    timeframes = ["5m"] + (timeframes or default_sel)
 
 candles_limit = st.number_input("Candles per TF", value=240, min_value=100, max_value=2000, step=10)
 include_sent_snapshot = st.checkbox("Include sentiment (snapshot)", value=True)
@@ -123,13 +154,20 @@ if st.button("Build snapshot now", key="build_snapshot_btn"):
     if not working_universe:
         st.error("Working list is empty. Add symbols or run the trending scan first.")
     else:
+        positions_map = _parse_positions(positions_text)
+
         sparams = SnapshotParams.with_defaults(
             timeframes=timeframes or DEFAULT_TFS,
             candles_limit=candles_limit,
             exchange_name=exchange_name,
             universe=working_universe,
-            include_sentiment=include_sent_snapshot,   # ✅
-            meta={"ui_timeframes": timeframes or DEFAULT_TFS, "ui_symbols": working_universe},
+            include_sentiment=include_sent_snapshot,
+            meta={
+                "ui_timeframes": timeframes or DEFAULT_TFS,
+                "ui_symbols": working_universe,
+                # pass positions if provided → enables profit_pct & L0 early-partial calc
+                "positions": positions_map if positions_map else {},
+            },
         )
         snapshot = build_snapshot_v41(sparams)
 
