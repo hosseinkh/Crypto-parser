@@ -38,12 +38,41 @@ def atr_pct(ohlcv: List[List[float]], period: int = 14) -> float:
     return (atr / lc) * 100.0 if lc else float("nan")
 
 def body_pct(ohlcv: List[List[float]]) -> float:
+    """
+    Body as % of full candle RANGE (matches playbooks).
+    Robust to bad indexing and tiny-range candles; clamped to [0, 100].
+    Expects each bar as [ts, open, high, low, close, volume].
+    """
     if not ohlcv:
         return float("nan")
-    o, c = ohlcv[-1][1], ohlcv[-1][4]
-    high = ohlcv[-1][2]; low = ohlcv[-1][3]
-    rng = max(high - low, 1e-12)
-    return abs(c - o) / rng * 100.0
+    try:
+        _, o, h, l, c, _ = ohlcv[-1]
+        if not all(isinstance(x, (int, float)) for x in (o, h, l, c)):
+            return float("nan")
+        rng = max(h - l, 1e-12)
+        val = abs(c - o) / rng * 100.0
+        # Numerical guard: should never exceed 100 in proper data
+        if val < 0.0:
+            return 0.0
+        if val > 100.0:
+            return 100.0
+        return val
+    except Exception:
+        return float("nan")
+
+def body_pct_open(ohlcv: List[List[float]]) -> float:
+    """
+    Auxiliary metric: body as % of OPEN (debugging/analysis only).
+    """
+    if not ohlcv:
+        return float("nan")
+    try:
+        _, o, _, _, c, _ = ohlcv[-1]
+        if not isinstance(o, (int, float)) or not isinstance(c, (int, float)) or o == 0:
+            return float("nan")
+        return abs(c - o) / abs(o) * 100.0
+    except Exception:
+        return float("nan")
 
 def volume_zscore(ohlcv: List[List[float]], lookback: int = 50) -> float:
     if not ohlcv or len(ohlcv) < lookback:
@@ -206,7 +235,8 @@ def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
         "last": last_close(ohlcv),
         "rsi": rsi(closes, period=14),
         "atr_pct": atr_pct(ohlcv, period=14),
-        "body_pct": body_pct(ohlcv),
+        "body_pct": body_pct(ohlcv),            # range-based, for triggers
+        "body_pct_open": body_pct_open(ohlcv),  # auxiliary debug metric
         "vol_z": volume_zscore(ohlcv, lookback=50),
         "ema50": ema(closes, period=50),
     }
