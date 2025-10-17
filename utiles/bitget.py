@@ -1,6 +1,7 @@
 # utiles/bitget.py
 from __future__ import annotations
 import time
+import math
 from typing import Dict, List, Any, Optional
 
 try:
@@ -19,7 +20,10 @@ def _timeframe_ms(tf: str) -> int:
         "15m": 900_000,
         "30m": 1_800_000,
         "1h": 3_600_000,
+        "2h": 7_200_000,
         "4h": 14_400_000,
+        "6h": 21_600_000,
+        "12h": 43_200_000,
         "1d": 86_400_000,
     }
     if tf not in table:
@@ -51,6 +55,51 @@ def make_exchange(ex_name: Optional[str] = None, rate_limit: bool = True):
     return exchange
 
 
+def _normalize_row(row: Any) -> Optional[List[float]]:
+    """
+    Normalize a single OHLCV row to [ts, open, high, low, close, volume].
+    Returns None if the row is malformed.
+    """
+    if isinstance(row, (list, tuple)) and len(row) >= 5:
+        ts = row[0]
+        o = row[1] if len(row) > 1 else None
+        h = row[2] if len(row) > 2 else None
+        l = row[3] if len(row) > 3 else None
+        c = row[4] if len(row) > 4 else None
+        v = row[5] if len(row) > 5 else 0.0
+    elif isinstance(row, dict):
+        ts = row.get("timestamp") or row.get(0)
+        o = row.get("open")      or row.get(1)
+        h = row.get("high")      or row.get(2)
+        l = row.get("low")       or row.get(3)
+        c = row.get("close")     or row.get(4)
+        v = row.get("volume")    or row.get(5) or 0.0
+    else:
+        return None
+
+    vals = [ts, o, h, l, c, v]
+    if any(x is None for x in vals):
+        return None
+
+    try:
+        ts = int(ts)
+        o = float(o); h = float(h); l = float(l); c = float(c); v = float(v)
+    except Exception:
+        return None
+
+    # Drop NaN/Inf
+    for x in (o, h, l, c, v):
+        if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+            return None
+
+    # Ensure H/L envelope valid in case vendor flipped them
+    hi = max(h, l)
+    lo = min(h, l)
+    h, l = hi, lo
+
+    return [ts, o, h, l, c, v]
+
+
 def fetch_ohlcv_safe(
     ex,
     symbol: str,
@@ -62,22 +111,13 @@ def fetch_ohlcv_safe(
     now_ts: Optional[int] = None,
 ) -> List[List[Any]]:
     """
-    Robust OHLCV fetch with small retry to survive transient errors/rate limits.
-    Adds *closed_only* and *now_ts* so callers can enforce using only CLOSED candles
-    and align multiple timeframes to the SAME UTC close boundary.
-
-    Args:
-        ex: ccxt exchange instance
-        symbol: e.g. 'SOL/USDT'
-        timeframe: e.g. '15m', '1h', '4h'
-        limit: number of candles to fetch (<=0 coerced to 200)
-        since: optional starting timestamp (ms)
-        closed_only: if True (default), drop the currently forming candle
-        now_ts: optional "clock" (ms) to determine the latest closed boundary consistently
-                across different timeframes in the same snapshot
-
-    Returns:
-        List of [timestamp, open, high, low, close, volume]
+    Robust OHLCV fetch that normalizes rows to:
+        [timestamp(ms), open, high, low, close, volume]
+    - Retries on transient errors
+    - Sorts ascending
+    - Drops malformed rows / NaNs
+    - Fixes any flipped high/low
+    - Optionally drops the still-forming last candle using a shared clock
     """
     if limit <= 0:
         limit = 200
@@ -85,28 +125,48 @@ def fetch_ohlcv_safe(
     last_err = None
     for attempt in range(3):
         try:
-            rows = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
-            if not rows:
-                return rows
+            raw = ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
+            if not raw:
+                return []
 
-            if closed_only:
-                # Determine the latest closed-candle boundary using a shared clock.
-                now_ms = int(now_ts if now_ts is not None else time.time() * 1000)
-                last_close_boundary = _floor_ts_to_tf(now_ms, timeframe)
-                # The candle whose timestamp == last_close_boundary is the still-forming candle.
-                # If our last returned candle has that timestamp (or greater), drop it.
-                if rows and rows[-1][0] >= last_close_boundary:
-                    rows = rows[:-1]
+            # Normalize and filter
+            out: List[List[float]] = []
+            for row in raw:
+                norm = _normalize_row(row)
+                if norm is not None:
+                    out.append(norm)
 
-            return rows
+            if not out:
+                return []
+
+            # Sort ascending by timestamp (some exchanges return descending)
+            out.sort(key=lambda r: r[0])
+
+            # Drop last row if not closed (use shared now_ts for cross-TF alignment)
+            if closed_only and len(out) > 0:
+                tf_ms = _timeframe_ms(timeframe)
+                # If now_ts not provided, fall back to wall clock
+                clock = int(now_ts if now_ts is not None else time.time() * 1000)
+                last_closed_boundary = _floor_ts_to_tf(clock, timeframe)
+                # If the last bar's timestamp equals the current interval start, it's still forming.
+                if out[-1][0] >= last_closed_boundary:
+                    out = out[:-1]
+
+            # Trim to limit (after dropping open bar)
+            if limit and len(out) > limit:
+                out = out[-limit:]
+
+            return out
         except Exception as e:
             last_err = e
             time.sleep(0.5 + attempt * 0.7)
 
-    # final attempt: bubble the real error if it still fails
+    # Final fallback: raise the last error if we couldn't return
     if last_err:
         raise last_err
-    return ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit, since=since)
+
+    # As a last resort (shouldn't reach here)
+    return []
 
 
 def fetch_ticker_safe(ex, symbol: str) -> Dict[str, Any]:
