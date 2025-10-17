@@ -41,9 +41,6 @@ def body_pct(ohlcv: List[List[float]]) -> float:
     if not ohlcv:
         return float("nan")
     o, c = ohlcv[-1][1], ohlcv[-1][4]
-    if not o or not c:
-        return float("nan")
-    # Body vs candle range is playbook spec; body/open gives similar behavior but we keep range.
     high = ohlcv[-1][2]; low = ohlcv[-1][3]
     rng = max(high - low, 1e-12)
     return abs(c - o) / rng * 100.0
@@ -83,7 +80,7 @@ def dist_to_range_pct(ohlcv: List[List[float]], lookback: int = 120) -> Dict[str
         "dist_to_range_low":  (lc - low) / (lc or 1e-12) * 100.0,
     }
 
-# --- enhanced: helpers for exit-intelligence metrics --------------------------
+# --- helpers for exit-intelligence metrics ------------------------------------
 
 def _vpr10_features(ohlcv: List[List[float]]) -> Dict[str, Any]:
     """
@@ -107,7 +104,7 @@ def _vpr10_features(ohlcv: List[List[float]]) -> Dict[str, Any]:
     vpr10 = vols[-1] / (sma10 or 1e-12) if sma10 == sma10 else float("nan")
     out["vpr10"] = vpr10
 
-    # legacy/looser: < 0.80 last 3 counts
+    # legacy: count of last 3 bars where vpr10 < 0.80
     flags_08 = 0
     for i in range(3):
         j_end = len(vols) - (2 - i)
@@ -172,6 +169,34 @@ class SnapshotParams:
     universe: Optional[List[str]] = None
     include_sentiment: bool = True
     meta: Optional[Dict[str, Any]] = None  # e.g. {"positions": {"SOL/USDT": {"entry_price": ...}}}
+
+    @classmethod
+    def with_defaults(
+        cls,
+        timeframes: Optional[List[str]] = None,
+        candles_limit: Optional[int] = None,
+        exchange_name: str = "bitget",
+        favorites: Optional[List[str]] = None,
+        universe: Optional[List[str]] = None,
+        include_sentiment: bool = True,
+        meta: Optional[Dict[str, Any]] = None,
+        ensure_5m: bool = True,
+    ) -> "SnapshotParams":
+        tfs = list(timeframes) if timeframes else list(DEFAULT_TFS)
+        if ensure_5m and "5m" not in tfs:
+            tfs = ["5m"] + tfs
+        limit = candles_limit if (isinstance(candles_limit, int) and candles_limit > 0) else FALLBACK_LIMIT
+        uni = universe or favorites or []
+        fav = favorites
+        return cls(
+            timeframes=tfs,
+            candles_limit=limit,
+            exchange_name=exchange_name or "bitget",
+            favorites=fav,
+            universe=uni,
+            include_sentiment=include_sentiment if include_sentiment is not None else True,
+            meta=meta or {},
+        )
 
 # ------------------------ TF feature pack -------------------------------------
 
@@ -287,7 +312,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            # L1: micro-divergence (5m vs 15m) — playbook spec gap <= -7.0
+            # L1: micro-divergence (5m vs 15m) — playbook spec: gap <= -7.0
             if ("5m" in ohlcv_by_tf) and ("15m" in tf_blocks):
                 closes_5m = [x[4] for x in ohlcv_by_tf["5m"]]
                 rsi5_now = rsi(closes_5m, period=14)
