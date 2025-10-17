@@ -43,7 +43,10 @@ def body_pct(ohlcv: List[List[float]]) -> float:
     o, c = ohlcv[-1][1], ohlcv[-1][4]
     if not o or not c:
         return float("nan")
-    return abs(c - o) / o * 100.0
+    # Body vs candle range is playbook spec; body/open gives similar behavior but we keep range.
+    high = ohlcv[-1][2]; low = ohlcv[-1][3]
+    rng = max(high - low, 1e-12)
+    return abs(c - o) / rng * 100.0
 
 def volume_zscore(ohlcv: List[List[float]], lookback: int = 50) -> float:
     if not ohlcv or len(ohlcv) < lookback:
@@ -59,9 +62,6 @@ def last_close(ohlcv: List[List[float]]) -> float:
     return ohlcv[-1][4] if ohlcv else float("nan")
 
 def ema(values: List[float], period: int) -> float:
-    """
-    Simple EMA for the full series; returns the latest EMA value.
-    """
     if len(values) < period:
         return float("nan")
     k = 2.0 / (period + 1.0)
@@ -70,27 +70,33 @@ def ema(values: List[float], period: int) -> float:
         ema_val = v * k + ema_val * (1.0 - k)
     return ema_val
 
-def dist_to_extremes_pct(ohlcv: List[List[float]], lookback: int = 120) -> Dict[str, float]:
+def dist_to_range_pct(ohlcv: List[List[float]], lookback: int = 120) -> Dict[str, float]:
+    """
+    Playbook naming: dist_to_range_high / dist_to_range_low (in %)
+    """
     closes = [x[4] for x in (ohlcv[-lookback:] if len(ohlcv) >= lookback else ohlcv)]
     if not closes:
-        return {"to_high_pct": float("nan"), "to_low_pct": float("nan")}
+        return {"dist_to_range_high": float("nan"), "dist_to_range_low": float("nan")}
     high = max(closes); low = min(closes); lc = closes[-1]
-    to_high = (high - lc) / lc * 100.0 if lc else float("nan")
-    to_low = (lc - low) / lc * 100.0 if lc else float("nan")
-    return {"to_high_pct": to_high, "to_low_pct": to_low}
+    return {
+        "dist_to_range_high": (high - lc) / (lc or 1e-12) * 100.0,
+        "dist_to_range_low":  (lc - low) / (lc or 1e-12) * 100.0,
+    }
 
 # --- enhanced: helpers for exit-intelligence metrics --------------------------
 
 def _vpr10_features(ohlcv: List[List[float]]) -> Dict[str, Any]:
     """
-    Computes a small set of VPR10 helper features:
+    Returns:
       - vpr10: volume / SMA10(volume)
-      - vpr10_lt_0_8_last3: count of last 3 bars where vpr10 < 0.8
-      - vpr10_drop_pct_from_peak_last3: drop percentage from max(vpr10 last 10) to current vpr10 (capped by last 3)
+      - vpr10_lt_0_8_last3: (kept for UI)
+      - vpr10_lt_0_75_last3: strict (all last 3 bars < 0.75) — used by Exit L2
+      - vpr10_drop_pct_from_peak_last3: drop % from recent peak to current
     """
     out = {
         "vpr10": float("nan"),
         "vpr10_lt_0_8_last3": None,
+        "vpr10_lt_0_75_last3": False,
         "vpr10_drop_pct_from_peak_last3": None,
     }
     if not ohlcv or len(ohlcv) < 12:
@@ -101,27 +107,30 @@ def _vpr10_features(ohlcv: List[List[float]]) -> Dict[str, Any]:
     vpr10 = vols[-1] / (sma10 or 1e-12) if sma10 == sma10 else float("nan")
     out["vpr10"] = vpr10
 
-    last3 = vols[-3:]
-    last3_sma10 = []
+    # legacy/looser: < 0.80 last 3 counts
+    flags_08 = 0
     for i in range(3):
         j_end = len(vols) - (2 - i)
         j_start = j_end - 10
         if j_start >= 0:
-            last3_sma10.append(sum(vols[j_start:j_end]) / 10.0)
-        else:
-            last3_sma10.append(float("nan"))
+            ma10 = sum(vols[j_start:j_end]) / 10.0
+            vv = vols[j_end - 1] / (ma10 or 1e-12)
+            if vv < 0.80:
+                flags_08 += 1
+    out["vpr10_lt_0_8_last3"] = flags_08
 
-    flags = 0
-    for v, m in zip(last3, last3_sma10):
-        try:
-            vv = v / (m or 1e-12)
-            if vv < 0.8:
-                flags += 1
-        except Exception:
-            pass
-    out["vpr10_lt_0_8_last3"] = flags
+    # strict: ALL last 3 bars below 0.75
+    strict_last3 = []
+    for i in range(3):
+        j_end = len(vols) - (2 - i)
+        j_start = j_end - 10
+        if j_start >= 0:
+            ma10 = sum(vols[j_start:j_end]) / 10.0
+            vv = vols[j_end - 1] / (ma10 or 1e-12)
+            strict_last3.append(vv < 0.75)
+    out["vpr10_lt_0_75_last3"] = (len(strict_last3) == 3 and all(strict_last3))
 
-    # drop from peak vpr10 in last 10 bars to current
+    # drop from peak of last ~10 vpr points to current
     vpr_series = []
     for idx in range(max(0, len(vols) - 10), len(vols)):
         m = sum(vols[max(0, idx - 10):idx]) / 10.0 if idx - 10 >= 0 else float("nan")
@@ -162,7 +171,7 @@ class SnapshotParams:
     favorites: Optional[List[str]] = None
     universe: Optional[List[str]] = None
     include_sentiment: bool = True
-    meta: Optional[Dict[str, Any]] = None  # can carry positions: {"positions": {sym: {"entry_price": ...}}}
+    meta: Optional[Dict[str, Any]] = None  # e.g. {"positions": {"SOL/USDT": {"entry_price": ...}}}
 
 # ------------------------ TF feature pack -------------------------------------
 
@@ -174,11 +183,11 @@ def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
         "atr_pct": atr_pct(ohlcv, period=14),
         "body_pct": body_pct(ohlcv),
         "vol_z": volume_zscore(ohlcv, lookback=50),
-        "ema50": ema(closes, period=50),   # NEW: for BTC_1h EMA50 check
+        "ema50": ema(closes, period=50),
     }
-    feats.update(dist_to_extremes_pct(ohlcv, lookback=120))
+    feats.update(dist_to_range_pct(ohlcv, lookback=120))
 
-    # NEW: entry volume vs MA20 ratio (for 15m trigger checks)
+    # entry volume vs MA20 ratio (for 15m trigger checks)
     def _vol_ma20_ratio(series):
         if not ohlcv or len(ohlcv) < 21:
             return float("nan")
@@ -187,18 +196,14 @@ def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
         return vols[-1] / (ma20 or 1e-12)
     feats["entry_volume_ma_ratio"] = _vol_ma20_ratio(ohlcv)
 
-    # --- VPR10 metrics (Layer 2 / L0 uses the peak & drop too)
-    vpr_block = _vpr10_features(ohlcv)
-    feats.update(vpr_block)
-
+    feats.update(_vpr10_features(ohlcv))
     return feats
 
 # ------------------------ main snapshot builder --------------------------------
 
 def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
     """
-    Fast multi-timeframe snapshot with optional sentiment per symbol.
-    Enforces closed-candle alignment across TFs by sharing a single now_ts.
+    Multi-timeframe snapshot with optional sentiment, aligned to closed candles.
     """
     ex = make_exchange(params.exchange_name)
 
@@ -211,8 +216,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
     # Shared clock for closed-candle alignment
     now_ms = int(time.time() * 1000)
 
-    # Optional positions map for profit calculations:
-    # params.meta = {"positions": {"SOL/USDT": {"entry_price": 132.5, "entry_ts": 1699999999000}, ...}}
+    # positions map for early-partial computations
     positions_map: Dict[str, Dict[str, Any]] = {}
     if params.meta and isinstance(params.meta.get("positions"), dict):
         positions_map = params.meta["positions"]
@@ -226,8 +230,8 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                 ohlcv = fetch_ohlcv_safe(
                     ex, symbol, tf, params.candles_limit,
                     since=None,
-                    closed_only=True,            # enforce closed candles
-                    now_ts=now_ms,               # align all TFs to the same boundary
+                    closed_only=True,
+                    now_ts=now_ms,
                 )
                 ohlcv_by_tf[tf] = ohlcv
                 tf_blocks[tf] = {
@@ -235,7 +239,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                     "ohlcv_len": len(ohlcv),
                     "timeframe": tf,
                     "last_closed_ts": (ohlcv[-1][0] if ohlcv else None),
-                    "last_candles": (ohlcv[-50:] if ohlcv else []),   # NEW: keep tail for derived/BTC logic
+                    "last_candles": (ohlcv[-50:] if ohlcv else []),  # tail used by BTC 15m checks & L1/L2
                 }
 
             tick = fetch_ticker_safe(ex, symbol)
@@ -244,22 +248,20 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             sentiment_block = None
             if params.include_sentiment:
                 sent_score, sent_details = get_sentiment_for_symbol(symbol)
-                sentiment_block = {
-                    "score": sent_score,          # [-1 .. +1]
-                    "details": sent_details,      # provider breakdown
-                }
+                sentiment_block = {"score": sent_score, "details": sent_details}
 
             # -------------------------------------------------------------------
             # Derived blocks ----------------------------------------------------
             derived_block: Dict[str, Any] = {}
 
-            # NEW: higher-lows counters on 5m and 15m
+            # Higher-lows counters on 5m and 15m
             def _swing_lows(closes, left=1, right=1):
                 lows = []
                 n = len(closes)
                 for i in range(left, n - right):
                     c = closes[i]
-                    if all(c <= closes[i - k] for k in range(1, left + 1)) and all(c < closes[i + k] for k in range(1, right + 1)):
+                    if all(c <= closes[i - k] for k in range(1, left + 1)) and \
+                       all(c <  closes[i + k] for k in range(1, right + 1)):
                         lows.append((i, c))
                 return lows
 
@@ -285,7 +287,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             except Exception:
                 pass
 
-            # L1: micro-divergence (requires 5m + 15m)
+            # L1: micro-divergence (5m vs 15m) — playbook spec gap <= -7.0
             if ("5m" in ohlcv_by_tf) and ("15m" in tf_blocks):
                 closes_5m = [x[4] for x in ohlcv_by_tf["5m"]]
                 rsi5_now = rsi(closes_5m, period=14)
@@ -296,7 +298,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                 rsi_gap = rsi5_now - rsi15_now
                 price_higher_high = (c_now > c_prev)
                 rsi5_lower_high = (rsi5_now < rsi5_prev)
-                exhaustion = (rsi_gap <= -5.0) and price_higher_high and rsi5_lower_high
+                exhaustion = (rsi_gap <= -7.0) and price_higher_high and rsi5_lower_high
 
                 derived_block["micro_divergence"] = {
                     "rsi5_now": rsi5_now,
@@ -308,17 +310,13 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                     "exhaustion": bool(exhaustion),
                 }
 
-            # L0: early partial (Surge Exhaustion)
-            # Needs: profit_pct (if entry known), ATR(15m) pct, and VPR10 drop from recent peak.
+            # L0: early partial (SET) — profit % vs ATR and VPR drop
             early_partial = None
             if "15m" in tf_blocks:
                 atr15_pct = tf_blocks["15m"]["features"].get("atr_pct")
                 vpr_drop_pct = tf_blocks["15m"]["features"].get("vpr10_drop_pct_from_peak_last3")
 
-                entry_price = None
-                if symbol in positions_map:
-                    entry_price = positions_map[symbol].get("entry_price")
-
+                entry_price = positions_map.get(symbol, {}).get("entry_price")
                 profit_pct = float("nan")
                 if entry_price and isinstance(entry_price, (int, float)) and entry_price > 0:
                     last_px = tf_blocks["15m"]["features"].get("last")
@@ -326,12 +324,8 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                         profit_pct = (last_px - entry_price) / entry_price * 100.0
 
                 atr_gain_multiple = float("nan")
-                if atr15_pct and isinstance(profit_pct, float):
-                    # how many ATR(15m) (in %) the unrealized gain represents
-                    try:
-                        atr_gain_multiple = profit_pct / atr15_pct if atr15_pct else float("nan")
-                    except Exception:
-                        atr_gain_multiple = float("nan")
+                if isinstance(atr15_pct, float) and atr15_pct == atr15_pct and isinstance(profit_pct, float):
+                    atr_gain_multiple = (profit_pct / atr15_pct) if atr15_pct else float("nan")
 
                 early_partial = {
                     "profit_pct": profit_pct,
@@ -343,12 +337,10 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             if early_partial:
                 derived_block["early_partial"] = {
                     "enabled": True,
-                    "profit_pct": profit_pct,
-                    "atr_gain_multiple_since_entry": atr_gain_multiple,
-                    "vpr10_drop_pct_from_peak_last3": vpr_drop_pct,
+                    "profit_pct": early_partial["profit_pct"],
+                    "atr_gain_multiple_since_entry": early_partial["atr_gain_multiple"],
+                    "vpr10_drop_pct_from_peak_last3": early_partial["vpr10_drop_pct_from_peak_last3"],
                 }
-
-            # -------------------------------------------------------------------
 
             return symbol, {
                 "symbol": symbol,
@@ -388,7 +380,6 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
         btc_1h_close = items[btc_key]["timeframes"]["1h"]["features"].get("last")
         btc_1h_ema50 = items[btc_key]["timeframes"]["1h"]["features"].get("ema50")
 
-        # Bear bias if short-term is weak AND 1h is below neutral
         bear_bias = (isinstance(btc_15, float) and btc_15 < 45.0) and (isinstance(btc_1h, float) and btc_1h < 50.0)
 
         market_block["btc_anchor_bias"] = {
@@ -401,7 +392,7 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             "btc_1h_above_ema50": (isinstance(btc_1h_close, float) and isinstance(btc_1h_ema50, float) and btc_1h_close > btc_1h_ema50),
         }
 
-        # NEW: rsi15_drop_pts and ll_with_volume_15m
+        # NEW: rsi15_drop_pts and ll_with_volume_15m (from 15m tail)
         try:
             btc_15_block = items[btc_key]["timeframes"]["15m"]
             tail = btc_15_block.get("last_candles") or []
@@ -430,13 +421,16 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Mirror boolean to each symbol for convenience
+        # Mirror booleans into each symbol for playbook convenience
         for s, block in items.items():
             try:
                 if "timeframes" in block:
+                    block.setdefault("derived", {})
                     block.setdefault("market_flags", {})
                     block["market_flags"]["btc_bear"] = bool(bear_bias)
                     block["market_flags"]["btc_1h_above_ema50"] = market_block["btc_anchor_bias"]["btc_1h_above_ema50"]
+                    # Alias used by Exit Intelligence L3:
+                    block["derived"]["btc_anchor_bias_bear"] = bool(bear_bias)
             except Exception:
                 pass
 
@@ -448,9 +442,9 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
         "candles_limit": params.candles_limit,
         "exchange": ex.id,
         "items": items,
-        "market": market_block,   # includes BTC EMA50 & bear bias + new fields
+        "market": market_block,
         "meta": {
             **(params.meta or {}),
-            "now_ts": now_ms,     # shared clock used for closed-candle alignment
+            "now_ts": now_ms,
         },
     }
