@@ -1,7 +1,6 @@
 # utiles/snapshot.py
 from __future__ import annotations
-import time
-import statistics
+import time, statistics
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -56,18 +55,6 @@ def volume_zscore(ohlcv: List[List[float]], lookback: int = 50) -> float:
 def last_close(ohlcv: List[List[float]]) -> float:
     return ohlcv[-1][4] if ohlcv else float("nan")
 
-def ema(values: List[float], period: int) -> float:
-    """
-    Simple EMA for the full series; returns the latest EMA value.
-    """
-    if len(values) < period:
-        return float("nan")
-    k = 2.0 / (period + 1.0)
-    ema_val = statistics.mean(values[:period])
-    for v in values[period:]:
-        ema_val = v * k + ema_val * (1.0 - k)
-    return ema_val
-
 def dist_to_extremes_pct(ohlcv: List[List[float]], lookback: int = 120) -> Dict[str, float]:
     closes = [x[4] for x in (ohlcv[-lookback:] if len(ohlcv) >= lookback else ohlcv)]
     if not closes:
@@ -77,50 +64,70 @@ def dist_to_extremes_pct(ohlcv: List[List[float]], lookback: int = 120) -> Dict[
     to_low = (lc - low) / lc * 100.0 if lc else float("nan")
     return {"to_high_pct": to_high, "to_low_pct": to_low}
 
-# --- enhanced: helpers for exit-intelligence metrics --------------------------
+# --- Added: helpers for exit-intelligence & v4.3 structure checks -------------
 
 def _vpr10_features(ohlcv: List[List[float]]) -> Dict[str, Any]:
-    """
-    Volume Pulse Ratio (VPR10):
-      vpr10 = current_volume / mean(prev 10 volumes)
-    Also returns:
-      - vpr10_lt_0_8_last3 (existing)
-      - vpr10_peak_last3 (peak within the last 3 completed bars)
-      - vpr10_drop_pct_from_peak_last3 (drop from that peak to current, in %)
-    """
     vols = [x[5] for x in ohlcv]
-    out = {
-        "vpr10": float("nan"),
-        "vpr10_lt_0_8_last3": False,
-        "vpr10_peak_last3": float("nan"),
-        "vpr10_drop_pct_from_peak_last3": float("nan"),
-    }
+    out = {"vpr10": float("nan"), "vpr10_lt_0_8_last3": False}
     if len(vols) < 12:
         return out
-
-    # current
     denom = statistics.mean(vols[-11:-1]) or 1e-12
-    vpr_now = vols[-1] / denom
-    out["vpr10"] = vpr_now
+    out["vpr10"] = vols[-1] / denom
 
-    # last 3 completed bars (including current as "bar 0")
-    vprs = []
-    peakscope = []
     try:
+        vprs = []
         for k in (0, 1, 2):
             denom_k = statistics.mean(vols[-(11 + k):-(1 + k)]) or 1e-12
-            vpr_k = vols[-(1 + k)] / denom_k
-            vprs.append(vpr_k)
-            peakscope.append(vpr_k)
+            vprs.append(vols[-(1 + k)] / denom_k)
         out["vpr10_lt_0_8_last3"] = all(v < 0.8 for v in vprs)
-        peak_last3 = max(peakscope)
-        out["vpr10_peak_last3"] = peak_last3
-        if peak_last3 > 0:
-            out["vpr10_drop_pct_from_peak_last3"] = (peak_last3 - vpr_now) / peak_last3 * 100.0
     except Exception:
         pass
-
     return out
+
+def _sma(vals: List[float], n: int) -> float:
+    if len(vals) < n:
+        return float("nan")
+    return sum(vals[-n:]) / float(n)
+
+def _lower_low_with_volume_15m(ohlcv_15: List[List[float]], vol_ma_len: int = 20, vol_mult: float = 1.2) -> bool:
+    """Return True if last swing makes a lower low AND that bar's volume >= vol_mult * MA(vol)."""
+    if len(ohlcv_15) < max(vol_ma_len + 2, 10):
+        return False
+    lows = [x[3] for x in ohlcv_15]
+    vols = [x[5] for x in ohlcv_15]
+    # naive swing: compare last low vs previous low
+    last_low = lows[-1]
+    prev_low = min(lows[-4:-1])  # small window
+    vol_ma = _sma(vols[:-1], vol_ma_len)
+    return (last_low < prev_low) and (vols[-1] >= (vol_ma * vol_mult if vol_ma == vol_ma else float("inf")))
+
+def _count_higher_lows(ohlcv: List[List[float]], lookback: int = 20) -> int:
+    """Count consecutive higher lows ending at last candle."""
+    if len(ohlcv) < 3:
+        return 0
+    lows = [x[3] for x in ohlcv[-lookback:]]
+    cnt = 0
+    for i in range(len(lows) - 1, 0, -1):
+        if lows[i] > lows[i - 1]:
+            cnt += 1
+        else:
+            break
+    return cnt
+
+def _first_bounce_after_flush(ohlcv: List[List[float]], lookback: int = 60, drop_pct: float = 3.0) -> bool:
+    """
+    Heuristic: detect a sharp flush (>= drop_pct%) over recent bars, and if current structure shows first higher-low bounce.
+    """
+    if len(ohlcv) < lookback:
+        return False
+    closes = [x[4] for x in ohlcv[-lookback:]]
+    if not closes or not closes[-1]:
+        return False
+    peak = max(closes)  # recent local peak in window
+    curr = closes[-1]
+    drop = (peak - curr) / peak * 100.0 if peak else 0.0
+    higher_lows = _count_higher_lows(ohlcv, lookback=20)
+    return (drop >= drop_pct) and (higher_lows == 1)
 
 def _last_two(vals: List[float]) -> Tuple[float, float]:
     if len(vals) >= 2:
@@ -146,7 +153,7 @@ class SnapshotParams:
     favorites: Optional[List[str]] = None
     universe: Optional[List[str]] = None
     include_sentiment: bool = True
-    meta: Optional[Dict[str, Any]] = None  # can carry positions: {"positions": {sym: {"entry_price": ...}}}
+    meta: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def with_defaults(timeframes: Optional[List[str]] = None, **kw) -> "SnapshotParams":
@@ -155,21 +162,15 @@ class SnapshotParams:
 # ------------------------ feature computation ---------------------------------
 
 def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
-    closes = [x[4] for x in ohlcv]
     feats = {
         "last": last_close(ohlcv),
-        "rsi": rsi(closes, period=14),
+        "rsi": rsi([x[4] for x in ohlcv], period=14),
         "atr_pct": atr_pct(ohlcv, period=14),
         "body_pct": body_pct(ohlcv),
         "vol_z": volume_zscore(ohlcv, lookback=50),
-        "ema50": ema(closes, period=50),   # NEW: for BTC_1h EMA50 check
     }
     feats.update(dist_to_extremes_pct(ohlcv, lookback=120))
-
-    # --- VPR10 metrics (Layer 2 / L0 uses the peak & drop too)
-    vpr_block = _vpr10_features(ohlcv)
-    feats.update(vpr_block)
-
+    feats.update(_vpr10_features(ohlcv))  # adds vpr10 & vpr10_lt_0_8_last3
     return feats
 
 # ------------------------ snapshot builder (parallel) -------------------------
@@ -177,7 +178,6 @@ def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
 def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
     """
     Fast multi-timeframe snapshot with optional sentiment per symbol.
-    Enforces closed-candle alignment across TFs by sharing a single now_ts.
     """
     ex = make_exchange(params.exchange_name)
 
@@ -187,51 +187,31 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
 
     all_symbols = sorted(set(base + ALWAYS_INCLUDE))
 
-    # Shared clock for closed-candle alignment
-    now_ms = int(time.time() * 1000)
-
-    # Optional positions map for profit calculations:
-    # params.meta = {"positions": {"SOL/USDT": {"entry_price": 132.5, "entry_ts": 1699999999000}, ...}}
-    positions_map: Dict[str, Dict[str, Any]] = {}
-    if params.meta and isinstance(params.meta.get("positions"), dict):
-        positions_map = params.meta["positions"]
-
     def work(symbol: str) -> Tuple[str, Any]:
         try:
             tf_blocks: Dict[str, Any] = {}
             ohlcv_by_tf: Dict[str, List[List[float]]] = {}
 
             for tf in params.timeframes:
-                ohlcv = fetch_ohlcv_safe(
-                    ex, symbol, tf, params.candles_limit,
-                    since=None,
-                    closed_only=True,            # enforce closed candles
-                    now_ts=now_ms,               # align all TFs to the same boundary
-                )
+                ohlcv = fetch_ohlcv_safe(ex, symbol, tf, params.candles_limit)
                 ohlcv_by_tf[tf] = ohlcv
                 tf_blocks[tf] = {
                     "features": _compute_features_for_tf(ohlcv),
                     "ohlcv_len": len(ohlcv),
                     "timeframe": tf,
-                    "last_closed_ts": (ohlcv[-1][0] if ohlcv else None),
                 }
 
             tick = fetch_ticker_safe(ex, symbol)
 
-            # Sentiment (optional)
             sentiment_block = None
             if params.include_sentiment:
                 sent_score, sent_details = get_sentiment_for_symbol(symbol)
-                sentiment_block = {
-                    "score": sent_score,          # [-1 .. +1]
-                    "details": sent_details,      # provider breakdown
-                }
+                sentiment_block = {"score": sent_score, "details": sent_details}
 
-            # --- Derived blocks ------------------------------------------------
-
+            # Derived structure bits for v4.3 gates (if we have 5m/15m)
             derived_block: Dict[str, Any] = {}
 
-            # L1: micro-divergence (requires 5m + 15m)
+            # L1 micro-divergence (optional, only if 5m present)
             if ("5m" in ohlcv_by_tf) and ("15m" in tf_blocks):
                 closes_5m = [x[4] for x in ohlcv_by_tf["5m"]]
                 rsi5_now = rsi(closes_5m, period=14)
@@ -254,50 +234,17 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
                     "exhaustion": bool(exhaustion),
                 }
 
-            # L0: early partial (Surge Exhaustion)
-            # Needs: profit_pct (if entry known), ATR(15m) pct, and VPR10 drop from recent peak.
-            early_partial = None
-            if "15m" in tf_blocks:
-                atr15_pct = tf_blocks["15m"]["features"].get("atr_pct")
-                vpr_drop_pct = tf_blocks["15m"]["features"].get("vpr10_drop_pct_from_peak_last3")
+            # NEW: structure metrics for gates
+            struct_block: Dict[str, Any] = {}
+            if "5m" in ohlcv_by_tf:
+                struct_block["higher_lows_5m"] = _count_higher_lows(ohlcv_by_tf["5m"], lookback=20)
+                struct_block["is_first_bounce_after_flush_5m"] = _first_bounce_after_flush(ohlcv_by_tf["5m"])
+            if "15m" in ohlcv_by_tf:
+                struct_block["higher_lows_15m"] = _count_higher_lows(ohlcv_by_tf["15m"], lookback=20)
+                struct_block["is_first_bounce_after_flush_15m"] = _first_bounce_after_flush(ohlcv_by_tf["15m"])
 
-                entry_price = None
-                if symbol in positions_map:
-                    entry_price = positions_map[symbol].get("entry_price")
-
-                profit_pct = float("nan")
-                if entry_price and isinstance(entry_price, (int, float)) and entry_price > 0:
-                    last_px = tf_blocks["15m"]["features"].get("last")
-                    if last_px:
-                        profit_pct = (last_px - entry_price) / entry_price * 100.0
-
-                atr_gain_multiple = float("nan")
-                if atr15_pct and isinstance(profit_pct, float):
-                    # how many ATR(15m) (in %) the unrealized gain represents
-                    if atr15_pct > 0:
-                        atr_gain_multiple = profit_pct / atr15_pct
-
-                # Condition (defaults from our design):
-                # profit ≥ 1.2%, atr_gain_multiple ≥ 1.5, vpr10_drop ≥ 25% from last3 peak
-                if (
-                    isinstance(profit_pct, float) and profit_pct >= 1.2 and
-                    isinstance(atr_gain_multiple, float) and atr_gain_multiple >= 1.5 and
-                    isinstance(vpr_drop_pct, float) and vpr_drop_pct >= 25.0
-                ):
-                    early_partial = True
-                elif (
-                    isinstance(profit_pct, float) and not (profit_pct != profit_pct)  # not NaN
-                ):
-                    early_partial = False  # explicitly mark evaluated & false
-
-                derived_block["early_partial"] = {
-                    "enabled": True,
-                    "profit_pct": profit_pct,
-                    "atr_gain_multiple_since_entry": atr_gain_multiple,
-                    "vpr10_drop_pct_from_peak_last3": vpr_drop_pct,
-                }
-
-            # -------------------------------------------------------------------
+            if struct_block:
+                derived_block.setdefault("structure", {}).update(struct_block)
 
             return symbol, {
                 "symbol": symbol,
@@ -322,32 +269,50 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             s, item = fut.result()
             items[s] = item
 
-    # --- BTC Anchor Bias (Layer 3) --------------------------------------------
-    def _get_first_key(d: Dict[str, Any], keys: List[str]) -> Optional[str]:
-        for k in keys:
-            if k in d:
-                return k
-        return None
+    # --- BTC Anchor Bias + v4.3 extra fields ----------------------------------
+    market_block: Dict[str, Any] = {}
+    btc_key = None
+    for k in ("BTC/USDT", "BTCUSDT", "BTC-USDT"):
+        if k in items:
+            btc_key = k
+            break
 
-    market_block = {}
-    btc_key = _get_first_key(items, ["BTC/USDT", "BTCUSDT", "BTC-USDT"])
-    if btc_key and ("15m" in items[btc_key].get("timeframes", {})) and ("1h" in items[btc_key]["timeframes"]):
-        btc_15 = items[btc_key]["timeframes"]["15m"]["features"].get("rsi")
-        btc_1h = items[btc_key]["timeframes"]["1h"]["features"].get("rsi")
-        btc_1h_close = items[btc_key]["timeframes"]["1h"]["features"].get("last")
-        btc_1h_ema50 = items[btc_key]["timeframes"]["1h"]["features"].get("ema50")
+    if btc_key:
+        btc_tfs = (items[btc_key] or {}).get("timeframes", {})
+        btc_15_rsi = (btc_tfs.get("15m", {}).get("features", {}) or {}).get("rsi")
+        btc_1h_rsi = (btc_tfs.get("1h",  {}).get("features", {}) or {}).get("rsi")
+        btc_4h_rsi = (btc_tfs.get("4h",  {}).get("features", {}) or {}).get("rsi")
 
-        # Bear bias if short-term is weak AND 1h is below neutral
-        bear_bias = (isinstance(btc_15, float) and btc_15 < 45.0) and (isinstance(btc_1h, float) and btc_1h < 50.0)
+        # Bear bias (same as before)
+        bear_bias = (isinstance(btc_15_rsi, float) and btc_15_rsi < 45.0) and (isinstance(btc_1h_rsi, float) and btc_1h_rsi < 50.0)
+
+        # NEW: lower-low-with-volume on 15m for Master/BTC gate definition
+        btc_15m_ohlcv = None
+        # Find original candles length param to refetch only if not present; we already have ohlcv from builder:
+        try:
+            # We didn't store raw ohlcv in items to keep snapshot light; re-fetch a small window here safely:
+            ex2 = make_exchange(params.exchange_name)
+            btc_15m_ohlcv = fetch_ohlcv_safe(ex2, btc_key.replace("-", "/"), "15m", limit=120)
+        except Exception:
+            btc_15m_ohlcv = None
+
+        lower_low_w_vol = _lower_low_with_volume_15m(btc_15m_ohlcv) if btc_15m_ohlcv else False
+
+        # NEW: 1h ATR/Close for the calm-exception volatility gate
+        atr_over_close_1h = None
+        try:
+            atr_over_close_1h = (btc_tfs.get("1h", {}).get("features", {}) or {}).get("atr_pct")
+        except Exception:
+            atr_over_close_1h = None
 
         market_block["btc_anchor_bias"] = {
             "bear": bool(bear_bias),
-            "rsi15": btc_15,
-            "rsi1h": btc_1h,
+            "rsi15": btc_15_rsi,
+            "rsi1h": btc_1h_rsi,
+            "rsi4h": btc_4h_rsi,
+            "lower_low_w_volume_15m": bool(lower_low_w_vol),
+            "atr_over_close_1h": atr_over_close_1h,
             "anchor_symbol": btc_key,
-            "btc_1h_close": btc_1h_close,
-            "btc_1h_ema50": btc_1h_ema50,
-            "btc_1h_above_ema50": (isinstance(btc_1h_close, float) and isinstance(btc_1h_ema50, float) and btc_1h_close > btc_1h_ema50),
         }
 
         # Mirror boolean to each symbol for convenience
@@ -355,17 +320,15 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
             if isinstance(item, dict):
                 item.setdefault("derived", {})
                 item["derived"]["btc_bear_bias"] = bool(bear_bias)
+
     # -------------------------------------------------------------------------
 
     return {
-        "version": "4.1",
+        "version": "4.2",
         "timeframes": params.timeframes,
         "candles_limit": params.candles_limit,
         "exchange": ex.id,
         "items": items,
-        "market": market_block,   # includes BTC EMA50 & bear bias
-        "meta": {
-            **(params.meta or {}),
-            "now_ts": now_ms,     # shared clock used for closed-candle alignment
-        },
+        "market": market_block,
+        "meta": (params.meta or {}) | {"now_ts": int(time.time() * 1000)},
     }
