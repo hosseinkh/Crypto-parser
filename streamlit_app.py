@@ -4,9 +4,35 @@ import json, io
 import streamlit as st
 from typing import List, Dict, Any
 
-from utiles.snapshot import SnapshotParams, build_snapshot_v41, DEFAULT_TFS
-from utiles.trending import scan_trending, explain_trending_row, TrendScanParams
-from utiles.bitget import make_exchange
+# --- BEGIN: robust import bootstrap (minimal fix for Streamlit Cloud path issues) ---
+import os, sys
+from pathlib import Path
+
+THIS_FILE = Path(__file__).resolve()
+CANDIDATE_PATHS = [
+    THIS_FILE.parent,                              # .../crypto-parser/
+    THIS_FILE.parent / "utiles",                   # .../crypto-parser/utiles
+    THIS_FILE.parent.parent,                       # repo root
+    THIS_FILE.parent.parent / "crypto-parser",     # repo_root/crypto-parser
+    THIS_FILE.parent.parent / "crypto-parser" / "utiles",
+]
+for p in CANDIDATE_PATHS:
+    if p.exists():
+        s = str(p)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+
+# Primary imports (package style)
+try:
+    from utiles.snapshot import SnapshotParams, build_snapshot_v41, DEFAULT_TFS
+    from utiles.trending import scan_trending, explain_trending_row, TrendScanParams
+    from utiles.bitget import make_exchange
+# Fallback imports (flat module style, if package import fails)
+except Exception:
+    from snapshot import SnapshotParams, build_snapshot_v41, DEFAULT_TFS
+    from trending import scan_trending, explain_trending_row, TrendScanParams
+    from bitget import make_exchange
+# --- END: robust import bootstrap ---
 
 st.set_page_config(page_title="Crypto parser", page_icon="📊", layout="centered")
 
