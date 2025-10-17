@@ -4,35 +4,23 @@ import json, io
 import streamlit as st
 from typing import List, Dict, Any
 
-# --- BEGIN: robust import bootstrap (minimal fix for Streamlit Cloud path issues) ---
-import os, sys
+# --- BEGIN: strict package import bootstrap (fixes Streamlit Cloud ImportError) ---
+import sys
 from pathlib import Path
 
-THIS_FILE = Path(__file__).resolve()
-CANDIDATE_PATHS = [
-    THIS_FILE.parent,                              # .../crypto-parser/
-    THIS_FILE.parent / "utiles",                   # .../crypto-parser/utiles
-    THIS_FILE.parent.parent,                       # repo root
-    THIS_FILE.parent.parent / "crypto-parser",     # repo_root/crypto-parser
-    THIS_FILE.parent.parent / "crypto-parser" / "utiles",
-]
-for p in CANDIDATE_PATHS:
-    if p.exists():
-        s = str(p)
-        if s not in sys.path:
-            sys.path.insert(0, s)
+APP_DIR = Path(__file__).resolve().parent            # .../crypto-parser
+REPO_DIR = APP_DIR.parent                            # repo root
 
-# Primary imports (package style)
-try:
-    from utiles.snapshot import SnapshotParams, build_snapshot_v41, DEFAULT_TFS
-    from utiles.trending import scan_trending, explain_trending_row, TrendScanParams
-    from utiles.bitget import make_exchange
-# Fallback imports (flat module style, if package import fails)
-except Exception:
-    from snapshot import SnapshotParams, build_snapshot_v41, DEFAULT_TFS
-    from trending import scan_trending, explain_trending_row, TrendScanParams
-    from bitget import make_exchange
-# --- END: robust import bootstrap ---
+# Ensure Python can locate the 'utiles' package
+for p in (str(APP_DIR), str(REPO_DIR)):
+    if p not in sys.path:
+        sys.path.insert(0, p)
+
+# Strict imports — no flat fallback (keeps relative imports working inside utiles/)
+from utiles.snapshot import SnapshotParams, build_snapshot_v41, DEFAULT_TFS
+from utiles.trending import scan_trending, explain_trending_row, TrendScanParams
+from utiles.bitget import make_exchange
+# --- END: strict package import bootstrap ---
 
 st.set_page_config(page_title="Crypto parser", page_icon="📊", layout="centered")
 
