@@ -51,7 +51,6 @@ def body_pct(ohlcv: List[List[float]]) -> float:
             return float("nan")
         rng = max(h - l, 1e-12)
         val = abs(c - o) / rng * 100.0
-        # Numerical guard: should never exceed 100 in proper data
         if val < 0.0:
             return 0.0
         if val > 100.0:
@@ -238,6 +237,7 @@ def _compute_features_for_tf(ohlcv: List[List[float]]) -> Dict[str, Any]:
         "body_pct": body_pct(ohlcv),            # range-based, for triggers
         "body_pct_open": body_pct_open(ohlcv),  # auxiliary debug metric
         "vol_z": volume_zscore(ohlcv, lookback=50),
+        "ema20": ema(closes, period=20),        # NEW: requested by framework
         "ema50": ema(closes, period=50),
     }
     feats.update(dist_to_range_pct(ohlcv, lookback=120))
