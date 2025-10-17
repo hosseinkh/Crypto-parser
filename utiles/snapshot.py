@@ -69,15 +69,15 @@ def ema(values: List[float], period: int) -> float:
 
 def dist_to_range_pct(ohlcv: List[List[float]], lookback: int = 120) -> Dict[str, float]:
     """
-    Playbook naming: dist_to_range_high / dist_to_range_low (in %)
+    Playbooks expect keys: to_high_pct / to_low_pct (percent distances).
     """
     closes = [x[4] for x in (ohlcv[-lookback:] if len(ohlcv) >= lookback else ohlcv)]
     if not closes:
-        return {"dist_to_range_high": float("nan"), "dist_to_range_low": float("nan")}
+        return {"to_high_pct": float("nan"), "to_low_pct": float("nan")}
     high = max(closes); low = min(closes); lc = closes[-1]
     return {
-        "dist_to_range_high": (high - lc) / (lc or 1e-12) * 100.0,
-        "dist_to_range_low":  (lc - low) / (lc or 1e-12) * 100.0,
+        "to_high_pct": (high - lc) / (lc or 1e-12) * 100.0,
+        "to_low_pct":  (lc - low) / (lc or 1e-12) * 100.0,
     }
 
 # --- helpers for exit-intelligence metrics ------------------------------------
@@ -237,6 +237,10 @@ def build_snapshot_v41(params: SnapshotParams) -> Dict[str, Any]:
         raise ValueError("Universe is empty. Provide favorites or universe.")
 
     all_symbols = sorted(set(base + ALWAYS_INCLUDE))
+
+    # Ensure BTC anchor always computed even if not explicitly in universe
+    if "BTC/USDT" not in all_symbols:
+        all_symbols.append("BTC/USDT")
 
     # Shared clock for closed-candle alignment
     now_ms = int(time.time() * 1000)
